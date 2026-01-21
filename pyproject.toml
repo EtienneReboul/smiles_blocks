@@ -1,6 +1,6 @@
 [build-system]
-requires = ["flit_core >=3.2,<4"]
-build-backend = "flit_core.buildapi"
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "smiles_blocks"
@@ -16,14 +16,17 @@ classifiers = [
     "License :: OSI Approved :: MIT License"
 ]
 dependencies = [
-    "loguru",
     "mkdocs",
     "pip",
     "pytest",
-    "python-dotenv",
     "ruff",
-    "tqdm",
-    "typer",
+    "dask",
+    "rdkit",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "numba",
+
 ]
 requires-python = "~=3.10.0"
 
