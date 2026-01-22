@@ -23,6 +23,7 @@ dependencies = [
     "scipy",
     "scikit-learn",
     "numba",
+    "pooch",
 ]
 requires-python = ">=3.10"
 

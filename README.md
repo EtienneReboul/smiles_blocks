@@ -62,9 +62,31 @@ Use pip to install smiles_block package using the pyproject.toml :
 
 ```bash
 cd smiles_blocks/
+# optional : create and active conda env
+# conda create -n smiles_blocks
+# conda activate smiles_blocks
 pip install .
 ```
 
 You should be ready to go !
+
+## Download Data
+
+To Download and convert the full MOSES dataset (train,test,scaffold) into an (py)Arrow Parquet Dataset,a module called dataset is design to that effect, here is a minimal example to do so :
+
+```bash
+# Optional : load the conda environement if you have one
+# conda activate 
+# conda activate smiles_blocks
+python -m smiles_blocks.dataset
+```
+
+The raw data will be downloaded in data/external and then repackaged parquet files in data/processed/moses_repackaged  with the following structure:
+
+| MOSES Dataset Split | Value |
+| ------------------- | ----- |
+| Number of files | 119 |
+| Number of row groups per file | 41 |
+| Number of rows per row group | 397 |
 
 --------
