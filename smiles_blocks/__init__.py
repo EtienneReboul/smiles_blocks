@@ -1,1 +1,1 @@
-from smiles_blocks import config  # noqa: F401
+"""SMILES blocks package for molecular fragmentation."""

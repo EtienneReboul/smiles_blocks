@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,26 +9,32 @@ description = "SMILES fragments that can be concatenated into a valid molecule"
 authors = [
   { name = "etienne_reboul" },
 ]
-license = { file = "LICENSE" }
+license = { text = "MIT" }
 readme = "README.md"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "License :: OSI Approved :: MIT License"
+    "Programming Language :: Python :: 3.10",
+    "License :: OSI Approved :: MIT License",
 ]
 dependencies = [
-    "mkdocs",
-    "pip",
-    "pytest",
-    "ruff",
     "dask",
     "rdkit",
     "numpy",
     "scipy",
     "scikit-learn",
     "numba",
-
 ]
-requires-python = "~=3.10.0"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "ruff",
+    "mkdocs",
+]
+
+[tool.setuptools]
+packages = ["smiles_blocks"]
 
 
 [tool.ruff]
