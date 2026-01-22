@@ -1,16 +1,13 @@
 # smiles_blocks
 
-<a target="_blank" href="https://cookiecutter-data-science.drivendata.org/">
-    <img src="https://img.shields.io/badge/CCDS-Project%20template-328F97?logo=cookiecutter" />
-</a>
+[![CCDS Project template](https://img.shields.io/badge/CCDS-Project%20template-328F97?logo=cookiecutter)](https://cookiecutter-data-science.drivendata.org/)
 
 SMILES fragments that can be concatenated into a valid molecule
 
 ## Project Organization
 
-```
+```text
 ├── LICENSE            <- Open-source license if one is chosen
-├── Makefile           <- Makefile with convenience commands like `make data` or `make train`
 ├── README.md          <- The top-level README for developers using this project.
 ├── data
 │   ├── external       <- Data from third party sources.
@@ -34,28 +31,40 @@ SMILES fragments that can be concatenated into a valid molecule
 ├── reports            <- Generated analysis as HTML, PDF, LaTeX, etc.
 │   └── figures        <- Generated graphics and figures to be used in reporting
 │
-├── requirements.txt   <- The requirements file for reproducing the analysis environment, e.g.
-│                         generated with `pip freeze > requirements.txt`
-│
-├── setup.cfg          <- Configuration file for flake8
-│
 └── smiles_blocks   <- Source code for use in this project.
     │
-    ├── __init__.py             <- Makes smiles_blocks a Python module
-    │
-    ├── config.py               <- Store useful variables and configuration
-    │
-    ├── dataset.py              <- Scripts to download or generate data
-    │
-    ├── features.py             <- Code to create features for modeling
-    │
-    ├── modeling                
-    │   ├── __init__.py 
-    │   ├── predict.py          <- Code to run model inference with trained models          
-    │   └── train.py            <- Code to train models
-    │
-    └── plots.py                <- Code to create visualizations
+        ├── __init__.py                  <- Makes smiles_blocks a Python module
+        │
+        ├── baseparams.py                <- Base parameters configuration
+        │
+        │
+        ├── dataset.py                   <- Scripts to download or generate data
+        │
+        │
+        ├── files.py                     <- Contains path to directories containing data and plots
+        │
+        ├── range_calibration.py         <- Module to models random SMILES generation
+        │
+        ├── smiles_fragmentation.py      <- SMILES fragmentation logic
+        │
+        └── utils.py                     <- General utility functions
 ```
 
---------
+## Installation
 
+To get started with this project, first clone the repository to your local machine:
+
+```bash
+git clone https://github.com/EtienneReboul/smiles_blocks.git
+```
+
+Use pip to install smiles_block package using the pyproject.toml :
+
+```bash
+cd smiles_blocks/
+pip install .
+```
+
+You should be ready to go !
+
+--------
