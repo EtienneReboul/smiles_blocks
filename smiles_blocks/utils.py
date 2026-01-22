@@ -37,8 +37,25 @@ import time
 
 # third-party modules
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+
+def check_partition_not_empty(partition: pd.DataFrame) -> bool:
+    """Check if a Dask DataFrame partition is not empty.
+    This function checks if the provided partition of a Dask DataFrame is not empty
+    (i.e., has not zero rows).
+    Parameters
+    ----------
+    partition : pandas.DataFrame
+        A partition of a Dask DataFrame.
+    Returns
+    -------
+    bool
+        True if the partition is not empty (has rows), False if it is empty.
+    """
+    return partition.shape[0] != 0
 
 
 def parse_time_left(time_str):
@@ -118,7 +135,6 @@ def dict_slicer(input_dict: dict, keys: list) -> dict:
         dict: The sliced dictionary.
     """
     return {key: input_dict[key] for key in keys if key in input_dict}
-
 
 
 def tuple2parquetschema(parquet_tuple: tuple) -> dict:
