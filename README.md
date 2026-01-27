@@ -52,6 +52,8 @@ SMILES fragments that can be concatenated into a valid molecule
 
 ## Installation
 
+### Regular install
+
 To get started with this project, first clone the repository to your local machine:
 
 ```bash
@@ -69,6 +71,14 @@ pip install .
 ```
 
 You should almost be ready to go !
+
+### Cluster install (Compute Canada)
+
+When using cluster, especially clusters with compute canada, best practice is that  the package should be installed at the beginning of each job in a virtualenv. Some package like Arrow and RDKit are loaded as module because they have cluster dependent compilation fo C/C++ code. We provide a script to test the installation  using the following command :
+
+```bash
+sbatch hpc_scripts/computecanada_narval_test_package_install.sh
+```
 
 ## Download Data
 
@@ -88,6 +98,12 @@ The raw data will be downloaded in data/external and then repackaged parquet fil
 | Number of files | 119 |
 | Number of row groups per file | 397 |
 | Number of rows per row group | 41 |
+
+If you are on cluster where downloading data using the loging node is frowned upon or have very limited access to internet you can download data locally and use the follow command line to updload data:
+
+```bash
+rsync -avz --progress data/processed/moses_repacked/ user@cluster:/path/to/destination/
+```
 
 ## Generate SMILES data
 
