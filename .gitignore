@@ -1,5 +1,7 @@
-# Data
-/data/
+# Data - ignore files but keep directory structure
+/data/**/*
+!/data/**/
+!/data/**/.gitkeep
 
 # vscode settings
 .vscode/
