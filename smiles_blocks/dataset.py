@@ -117,7 +117,7 @@ class MosesParquetFormat:
         )
     )
     max_rows_per_file: int = 16277
-    max_rows_per_group: int = 397
+    max_rows_per_group: int = 41
     compression: str = "zstd"
     compression_level: int = 12
 

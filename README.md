@@ -68,7 +68,7 @@ cd smiles_blocks/
 pip install .
 ```
 
-You should be ready to go !
+You should almost be ready to go !
 
 ## Download Data
 
@@ -86,7 +86,31 @@ The raw data will be downloaded in data/external and then repackaged parquet fil
 | MOSES Dataset Split | Value |
 | ------------------- | ----- |
 | Number of files | 119 |
-| Number of row groups per file | 41 |
-| Number of rows per row group | 397 |
+| Number of row groups per file | 397 |
+| Number of rows per row group | 41 |
+
+## Generate SMILES data
+
+this step is used to both generate randomized SMILES and record the number of unique SMILES  per number of randomized SMILES generated. The randomized SMILES process is stochastic, thus by default the operation is repeated 3 times in order to account for variability.
+
+There is two way to generate this data : local or cluster
+
+The local mode is used for testing purposes and should not be used for production:
+
+```bash
+# Optional : load the conda environement if you have one
+# conda activate 
+# conda activate smiles_blocks
+python jobs_scripts/dask_calibration_range.py --execution_mode local
+```
+
+The cluster mode is used for production on Compute Canada Narval Cluster, this launch a job array of 119 tasks , i.e the number of parquet files generated in the previous step, and is design to launch one dask cluster with 64 workers per task. You should customize the cluster script  and **don't forget to set the proper : #SBATCH --account=your_account**
+
+```bash
+# Optional : load the conda environement if you have one
+# conda activate 
+# conda activate smiles_blocks
+sbatch hpc_scripts/computecanada_narval_dask_calibration_range.sh
+```
 
 --------

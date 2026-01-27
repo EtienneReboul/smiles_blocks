@@ -110,7 +110,7 @@ def make_one_replica(
     mol = Chem.MolFromSmiles(smiles)
 
     #
-    for nb_smiles, count in make_calibrationrange(1, max_power):
+    for nb_smiles, count in make_calibrationrange(0, max_power):
         # create a random seed
         seed = hash(f"{count}_replica_{replica}") % 2**32
 
@@ -203,21 +203,22 @@ def smiles_set_to_col(smiles_set: set, nb_row: int) -> list[str]:
         smiles_col.extend([""] * (nb_row - set_length))
     else:
         # compute number of groups
-        n_groups, remainder = divmod(set_length, nb_row)
+        nb_smiles_per_group, remainder = divmod(set_length, nb_row)
         regrouped_smiles = []
+        start_idx = 0
 
-        for group_idx in range(n_groups):
-            if group_idx < remainder:
-                start_idx = group_idx * (nb_row + 1)
-                end_idx = start_idx + nb_row + 1
-            else:
-                start_idx = remainder * (nb_row + 1) + (group_idx - remainder) * nb_row
-                end_idx = start_idx + nb_row
+        for group_idx in range(nb_row):
+            end_idx = start_idx + nb_smiles_per_group + (1 if group_idx < remainder else 0)
+            regrouped_smiles.append("_".join(smiles_col[start_idx:end_idx]))
+            start_idx = end_idx
 
-            regrouped_smiles.append(smiles_col[start_idx:end_idx])
+        # overwrite smiles_col with regrouped smiles
+        smiles_col = regrouped_smiles
 
     # safety check
-    assert len(smiles_col) == nb_row, "The length of the smiles_col is not equal to nb_row"
+    assert len(smiles_col) == nb_row, (
+        f"The length of the smiles_col ({len(smiles_col)}) is not equal to nb_row ({nb_row})."
+    )
 
     return smiles_col
 
