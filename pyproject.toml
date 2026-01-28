@@ -17,7 +17,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 dependencies = [
-    "dask",
+    "dask[complete]",
     "rdkit",
     "numpy",
     "scipy",
