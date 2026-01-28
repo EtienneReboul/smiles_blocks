@@ -18,7 +18,7 @@ source $SLURM_TMPDIR/env/bin/activate
 
 export DASK_SCHEDULER_ADDR=$(hostname)
 
-export DASK_SCHEDULER_PORT= $((30000 + $RANDOM % 10000))
+export DASK_SCHEDULER_PORT=$((30000 + $RANDOM % 10000))
 
 dask scheduler --host $DASK_SCHEDULER_ADDR --port $DASK_SCHEDULER_PORT &
 
@@ -27,5 +27,5 @@ dask worker "tcp://$DASK_SCHEDULER_ADDR:$DASK_SCHEDULER_PORT" --no-dashboard --n
 
 sleep 10
 
-python jobs_scripts/dask_calibration_range.py --datafile data/moses_repacked/part-$SLURM_ARRAY_TASK_ID.parquet \
+python jobs_scripts/dask_calibration_range.py --datafile data/processed/moses_repacked/part-$SLURM_ARRAY_TASK_ID.parquet \
 --execution_mode cluster 
