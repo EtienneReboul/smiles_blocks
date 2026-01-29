@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --account=<your account>
 #SBATCH --cpus-per-task=64  
-#SBATCH --mem-per-cpu=500MB       
-#SBATCH --time=0-06:00
+#SBATCH --mem-per-cpu=800MB       
+#SBATCH --time=0-12:00
 #SBATCH --output=logs/calibration_range/job_%A/task_%a.out
 #SBATCH --error=logs/calibration_range/job_%A/task_%a.err
 #SBATCH --job-name="dask_calibration_range"
-#SBATCH --array=0-0
+#SBATCH --array=1-118
 
 module load python gcc arrow rdkit
 virtualenv --no-download $SLURM_TMPDIR/env
