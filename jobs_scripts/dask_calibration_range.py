@@ -93,15 +93,18 @@ smiles_blocks.range_calibration.make_datapoints : Function that generates calibr
 
 import argparse
 from dataclasses import dataclass, field
+from functools import partial
 import logging
+import multiprocessing as mp
 import os
 from pathlib import Path
 
-from dask import config as cfg
+import dask.config as cfg
 import dask.dataframe as dd
 from dask.distributed import Client, LocalCluster
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 
 from smiles_blocks.files import INTERIM_DATA_DIR, PROJ_ROOT
 from smiles_blocks.range_calibration import make_datapoints
@@ -116,12 +119,9 @@ class CalibrationParquetFormat:
 
     Attributes
     ----------
-    max_rows_per_file : int
-        Maximum number of rows to write per Parquet file.
-        Default is 16277.
-    max_rows_per_group : int
-        Maximum number of rows per row group within each Parquet file.
-        Default is 397.
+    schema : pa.Schema
+        PyArrow schema defining the structure of the output dataset.
+        Default schema contains multiple columns with appropriate types and metadata.
     compression : str
         Compression algorithm to use for the Parquet files.
         Default is "zstd".
@@ -163,12 +163,9 @@ def process_partition(
     partition: pd.DataFrame, max_power: int, patience: int, nb_replicas: int
 ) -> pd.DataFrame:
     """Process a partition of a DataFrame by generating datapoints for each row.
-
-    This function iterates over the provided partition DataFrame, expecting the columns
-    "smiles", "zinc_id", and "replica". For each row it calls make_datapoint(smiles, replica, max_power, patience=patience)
-    to produce a datapoint (pandas-compatible object such as a Series or DataFrame), attaches
-    the corresponding zinc_id to that datapoint, and concatenates all datapoints into a
-    single DataFrame with a reset integer index.
+    This function takes a pandas DataFrame partition containing SMILES strings and SPLIT
+    identifiers, applies the `make_datapoints` function to each SMILES string with the
+    specified parameters, and returns a concatenated DataFrame of the results.
 
     Parameters
     ----------
@@ -225,26 +222,16 @@ def process_partition(
     return results_df
 
 
-def main(configuration_dict):
+def first_run(
+    configuration_dict: dict,
+    parquet_format: CalibrationParquetFormat = CalibrationParquetFormat(),
+    logger: logging.Logger = logging.getLogger(__name__),
+) -> None:
     """
-    Main function to run the script
+    Function to run the script for the first time
     """
     # disable heartbeat because task are up to 20 minutes long
     cfg.set({"distributed.scheduler.worker-ttl": None})
-
-    # setup logging
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    logger = logging.getLogger(__name__)
-
-    # instantiate the parquet format configuration
-    parquet_format = CalibrationParquetFormat()
-
-    # make new output path
-    configuration_dict["output_path"] = (
-        Path(configuration_dict["output_path"]) / Path(configuration_dict["datafile"]).stem
-    )
-    # make sure the output path exists
-    configuration_dict["output_path"].mkdir(parents=True, exist_ok=True)
 
     # setup the dask client
     if configuration_dict["execution_mode"] == "local":
@@ -262,6 +249,9 @@ def main(configuration_dict):
         )
         logger.info("Connected to Dask cluster")
 
+    logger.info("Results saved to: %s", configuration_dict["output_path"])
+
+    # disable heartbeat because task are up to 20 minutes long
     # read the parquet file
     ddf = dd.read_parquet(configuration_dict["datafile"], engine="pyarrow", split_row_groups=True)
     ddf_results = ddf.map_partitions(
@@ -290,10 +280,158 @@ def main(configuration_dict):
         schema=parquet_format.schema,
     )
 
-    logger.info("Results saved to: %s", configuration_dict["output_path"])
-
     # terminate the dask client
     client.shutdown()
+
+
+def rerun(
+    configuration_dict: dict,
+    parquet_format: CalibrationParquetFormat = CalibrationParquetFormat(),
+    logger: logging.Logger = logging.getLogger(__name__),
+) -> None:
+    """Rerun the calibration processing for missing partitions using multiprocessing.
+
+    This function resumes an interrupted calibration run by processing only the
+    partitions that were not completed in a previous run. Unlike the initial run
+    which uses Dask, this function uses Python's multiprocessing module to process
+    individual row groups from the input parquet file.
+
+    The function reads the original parquet file row group by row group, checks if
+    the corresponding output file already exists, and processes only the missing
+    partitions. Each partition is processed in parallel using a multiprocessing pool,
+    with each SMILES string being passed to the make_datapoints function.
+
+    Parameters
+    ----------
+    configuration_dict : dict
+        Configuration dictionary containing processing parameters with the following keys:
+
+        - datafile : str or Path
+            Path to the input parquet file containing SMILES data
+        - output_path : Path
+            Directory path where output parquet files will be saved
+        - nb_replicas : int
+            Number of replicas to generate for each SMILES
+        - max_power : int
+            Maximum power parameter for random SMILES generation
+        - patience : int
+            Number of iterations without improvement before early stopping
+    parquet_format : CalibrationParquetFormat, optional
+        Parquet format configuration object containing schema, compression settings,
+        and other parquet-specific parameters. Default is a new instance of
+        CalibrationParquetFormat.
+    logger : logging.Logger, optional
+        Logger instance for outputting processing information. Default is a logger
+        for the current module.
+
+    Returns
+    -------
+    None
+        This function writes results directly to parquet files and does not return
+        any value.
+
+    Notes
+    -----
+    - This function is designed to be called when the output directory is not empty,
+      indicating a previous incomplete run.
+    - The use of pool map allows to allocate one SMILES processing per CPU core instead of
+      one row group per core with dask,the assumption is that each SMILES processing takes
+      a long time (up to 20 minutes) and this is the reason why the partition could not be
+      processed with Dask directly.
+    - The function uses multiprocessing with a pool size equal to the number of
+      available CPU cores.
+    - Output files are named as 'part.{i}.parquet' where i is the row group index.
+    - Each output file corresponds to one row group from the input parquet file.
+    - The function preserves the 'SPLIT' column from the input data in the output.
+
+    See Also
+    --------
+    first_run : Initial run function using Dask for distributed processing
+    make_datapoints : Core function that generates calibration datapoints
+    CalibrationParquetFormat : Configuration class for parquet output format
+    """
+
+    # get parquet file info
+    parquet_file = pq.ParquetFile(configuration_dict["datafile"])
+
+    # get the number of partitions
+    num_row_groups = parquet_file.num_row_groups
+
+    # iterate over the partitions
+    for i in range(num_row_groups):
+        # check if the partition is already processed
+        output_file = configuration_dict["output_path"] / f"part.{i}.parquet"
+
+        if not output_file.exists():
+            # log the processing
+            logger.info(f"Processing missing partition {i}/{num_row_groups}...")
+            # load the row group
+            row_group_table = parquet_file.read_row_group(i)
+
+            # convert to pandas dataframe
+            partition_df = row_group_table.to_pandas()
+
+            # gset partial function
+            process_func = partial(
+                make_datapoints,
+                nb_replica=configuration_dict["nb_replicas"],
+                max_power=configuration_dict["max_power"],
+                patience=configuration_dict["patience"],
+            )
+
+            # compute using pool
+            with mp.Pool(processes=mp.cpu_count()) as pool:
+                result_list = pool.map(process_func, partition_df["SMILES"])
+
+            # add split to each data frame
+            for i in range(len(result_list)):
+                result_list[i]["split"] = partition_df["SPLIT"][i]
+
+            # concatenate the results
+            result_df = pd.concat(result_list, ignore_index=True)
+
+            # transform into arrow table
+            result_df = pa.Table.from_pandas(result_df, schema=parquet_format.schema)
+
+            # write results
+            pq.write_table(
+                result_df,
+                str(output_file),
+                compression=parquet_format.compression,
+                compression_level=parquet_format.compression_level,
+            )
+    # log completion
+    logger.info("Rerun completed.")
+
+
+def main(configuration_dict: dict):
+    """
+    Main function to run the script
+    """
+
+    # setup logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger(__name__)
+
+    # instantiate the parquet format configuration
+    parquet_format = CalibrationParquetFormat()
+
+    # make new output path
+    configuration_dict["output_path"] = (
+        Path(configuration_dict["output_path"]) / Path(configuration_dict["datafile"]).stem
+    )
+    # make sure the output path exists
+    configuration_dict["output_path"].mkdir(parents=True, exist_ok=True)
+
+    # check if the output path is empty
+    if not os.listdir(configuration_dict["output_path"]):
+        # run the first time with dask backend
+        logger.info("Starting first run...")
+        first_run(configuration_dict, parquet_format)
+    else:
+        # rerun only missing partition with multiprocessing backend
+        logger.info("Found output files, restarting missing partitions...")
+        rerun(configuration_dict, parquet_format)
 
 
 if __name__ == "__main__":
