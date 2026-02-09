@@ -123,10 +123,38 @@ python jobs_scripts/dask_calibration_range.py --execution_mode local
 The cluster mode is used for production on Compute Canada Narval Cluster, this launch a job array of 119 tasks , i.e the number of parquet files generated in the previous step, and is design to launch one dask cluster with 64 workers per task. You should customize the cluster script  and **don't forget to set the proper : #SBATCH --account=your_account**
 
 ```bash
+sbatch hpc_scripts/computecanada_narval_dask_calibration_range.sh
+```
+
+## Repackage calibration results
+
+After the calibration jobs finish, use the repackaging script to validate that each per-file job produced all expected output shards and then consolidate them into single parquet files for modelling and SMILES data. By default it reads the MOSES parquet inputs from data/processed/moses_repacked, checks the corresponding Dask outputs under data/interim/dask_calibration_range, and writes consolidated outputs to data/processed/modelling_data and data/processed/smiles_data. You can run it locally with:
+
+```bash
 # Optional : load the conda environement if you have one
 # conda activate 
 # conda activate smiles_blocks
-sbatch hpc_scripts/computecanada_narval_dask_calibration_range.sh
+python jobs_scripts/repackage_calibration_results.py \
+    --input_datafolder data/processed/moses_repacked/ \
+    --output_datafolder data/interim/dask_calibration_range/ \
+    --log_path logs/repackage_calibration_results.log
+```
+
+Or you can run it on a SLURM cluster using the corresponding script, **don't forget to set the proper : #SBATCH --account=your_account** :
+
+```bash
+sbatch hpc_scripts/computecanada_narval_repackage_calibration_results.sh
+```
+
+### (Optional) Relaunching task
+
+If some jobs did not complete, look at the end of the log file, the last line should have all the indices of the missing jobs. There is a relaunching optio that auto-detect the presence of output files in the generation script, so you can just relaunch task by replacing the $MISSING_IDX by one of actual mising idx.
+
+```bash
+# Optional : load the conda environement if you have one
+# conda activate 
+# conda activate smiles_blocks
+python jobs_scripts/dask_calibration_range.py --datafile data/processed/moses_repacked/part-$MISSING_IDX.parquet --execution_mode local 
 ```
 
 --------
