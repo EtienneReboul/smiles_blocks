@@ -286,6 +286,15 @@ def calibration_range_postprocessing(input_folder, output_folder, logger):
         # output subfolder for the current parquet file
         output_subfolder = Path(output_folder) / parquet_file.stem
 
+        # check if final output already exists, if so skip
+        smiles_output_path = PROCESSED_DATA_DIR / "smiles_data" / parquet_file.name
+        modelling_output_path = PROCESSED_DATA_DIR / "modelling_data" / parquet_file.name
+        if smiles_output_path.exists() and modelling_output_path.exists():
+            logger.info(
+                f"Repackaged output already exists for file: {parquet_file.name}, skipping."
+            )
+            continue
+
         # check the completion of the job
         completion_status = check_job_completion(parquet_file, output_subfolder, logger)
 
@@ -304,19 +313,17 @@ def calibration_range_postprocessing(input_folder, output_folder, logger):
         # use pyarrow dataset to read all parquet files in the output subfolder
         dataset = ds.dataset(str(output_subfolder), output_file_parameter.schema)
 
-        # write modelling_file
-        processed_output_folder = PROCESSED_DATA_DIR / "modelling_data" / parquet_file.stem
-        processed_output_folder.mkdir(parents=True, exist_ok=True)
-        convert_calibration_to_modelling(
-            dataset, str(processed_output_folder), modelling_file_parameter
-        )
+        # create final output folders for smiles and modelling data
+        smiles_output_path = PROCESSED_DATA_DIR / "smiles_data" / parquet_file.stem
+        smiles_output_path.mkdir(parents=True, exist_ok=True)
+        modelling_output_folder = PROCESSED_DATA_DIR / "modelling_data" / parquet_file.stem
+        modelling_output_folder.mkdir(parents=True, exist_ok=True)
 
-        # process
-        processed_output_path = PROCESSED_DATA_DIR / "smiles_data" / parquet_file.stem
-        processed_output_path.mkdir(parents=True, exist_ok=True)
-        convert_calibration_to_smiles_data(
-            dataset, str(processed_output_path), SmilesParquetFormat()
+        # do the conversion to modelling and smiles data format
+        convert_calibration_to_modelling(
+            dataset, str(modelling_output_folder), modelling_file_parameter
         )
+        convert_calibration_to_smiles_data(dataset, str(smiles_output_path), SmilesParquetFormat())
 
         # log elapsed time for postprocessing
         end_time = time.time()
