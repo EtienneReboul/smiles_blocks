@@ -103,7 +103,20 @@ class ExponentialModel(FittingModel):
 
 @dataclass
 class ModelsRegistry:
-    """Registry for easy access to fitting models."""
+    """
+    Registry for easy access to fitting models.
+
+    Attributes
+    ----------
+    models : dict[str, FittingModel]
+        Dictionary mapping model identifiers to their respective FittingModel instances.
+        Available models:
+        - 'sqrt': Square root model
+        - 'log': Logarithmic model
+        - 'inverse': Inverse model
+        - 'inverse2': Alternative inverse model
+        - 'exp': Exponential model
+    """
 
     models: dict[str, FittingModel] = field(
         default_factory=lambda: {
