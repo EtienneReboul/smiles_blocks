@@ -61,7 +61,7 @@ class TestMosesParquetFormat:
         parquet_format = MosesParquetFormat()
 
         assert parquet_format.max_rows_per_file == 16277
-        assert parquet_format.max_rows_per_group == 397
+        assert parquet_format.max_rows_per_group == 41
         assert parquet_format.compression == "zstd"
         assert parquet_format.compression_level == 12
         assert isinstance(parquet_format.schema, pa.Schema)
@@ -133,6 +133,7 @@ class TestDatasetDownloader:
             known_hash=f"md5:{registry.md5hash}",
             fname=registry.fname,
             path=registry.intermediary_path,
+            progressbar=True,
         )
 
     @patch("smiles_blocks.dataset.pooch.retrieve")
