@@ -157,4 +157,38 @@ If some jobs did not complete, look at the end of the log file, the last line sh
 python jobs_scripts/dask_calibration_range.py --datafile data/processed/moses_repacked/part-$MISSING_IDX.parquet --execution_mode local 
 ```
 
+## Modelling randomized SMILES generation
+
+### Model growth with scipy
+
+To ensure that that all possible SMILES were exhaustively sampled we want to model the number of unique SMILES per the cumulative count of randomized SMILES. To that end we have  different model that are summarized in the following table :
+
+| Model name | Formula |
+| --- | --- |
+| Square Root | $y = \alpha \sqrt{\beta x}$ |
+| Logarithmic | $y = \alpha \log(\beta x)$ |
+| Inverse | $y = \frac{\alpha}{\beta + \frac{1}{x}}$ |
+| Inverse 2 | $y = \frac{\alpha}{1 + \frac{\beta}{x}}$ |
+| Exponential | $y = \alpha (1 - e^{-\beta x})$ |
+
+Modelling with scipy is relatively fast (~ 1 hour) and can be done locally , like so :
+
+```bash
+# Optional : load the conda environement if you have one
+# conda activate 
+# conda activate smiles_blocks
+python jobs_scripts/smiles_generation_modelling.py --nb_wokers 6 
+```
+
+### Plotting modelling results
+
+Once  the modelling is done, you can visualize the results with the following notebook. You may need to install jupyter notebook if you have not done it already. The results will be saved in the reports folder.
+
+```bash
+# Optional : load the conda environement if you have one
+# conda activate 
+# conda activate smiles_blocks
+jupyter notebook notebooks/2-er-visualize_modeling_results.ipynb
+```
+
 --------
