@@ -6,6 +6,8 @@ import numpy as np
 from rdkit import Chem
 from rdkit.Chem import Crippen, rdMolDescriptors
 
+from smiles_blocks.utils import reverse_dict
+
 
 @dataclass
 class ExtendedRoThreeThreshold:
@@ -235,13 +237,8 @@ def get_smiles_frag_mapping(smiles: str) -> dict[str, str | dict]:
     # package result as a dictionary
     smiles_fragment_results["canonicalidces2bondstridx"] = canonicalidces2bondstridx
     smiles_fragment_results["idx2canonicalidx"] = idx2canonicalidx
-    smiles_fragment_results["bondidx2canonicalidces"] = {
-        bond_stridx: bond_canonicalidces
-        for bond_canonicalidces, bond_stridx in canonicalidces2bondstridx.items()
-    }
-    smiles_fragment_results["canonicalidx2idx"] = {
-        canonical_idx: idx for idx, canonical_idx in idx2canonicalidx.items()
-    }
+    smiles_fragment_results["bondidx2canonicalidces"] = reverse_dict(canonicalidces2bondstridx)
+    smiles_fragment_results["canonicalidx2idx"] = reverse_dict(idx2canonicalidx)
 
     return smiles_fragment_results
 
@@ -575,6 +572,7 @@ def process_set_smiles(
 
     # instantiate local variable
     max_matched_bonds = 0
+    mem_score_store = -1
     threshold_dict = vars(ExtendedRoThreeThreshold())
     blocked_smiles_results = vars(BlockedSmilesResult())
 
@@ -615,6 +613,7 @@ def process_set_smiles(
             retrosynth_results,
             threshold_dict,
         )
+        mem_score_store = mem_score
 
         # check if maxium recovery is reached
         if len(matched_bond) == max_breakdown:
@@ -635,6 +634,9 @@ def process_set_smiles(
     blocked_smiles_results["nb_block_cq_ok"] = sum(
         block_result["status"] for block_result in block_results
     )
-    blocked_smiles_results["retro_bond_ratio"] = max_matched_bonds / max_breakdown
+    blocked_smiles_results["retro_bond_ratio"] = (
+        max_matched_bonds / max_breakdown if max_breakdown > 0 else 0
+    )
+    blocked_smiles_results["mem_score"] = mem_score_store
 
     return True, blocked_smiles_results, block_results

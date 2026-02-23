@@ -160,7 +160,7 @@ def annotate_rbond(
 def retrosynthetic_analysis(
     smiles: str,
     chemical_dict: dict | None = None,
-) -> dict:
+) -> dict[dict[set[str]]]:
     """This function find the retro-synthetic bonds in each molecule.
 
     Args:
@@ -174,7 +174,10 @@ def retrosynthetic_analysis(
                             and the bond information as value
 
     Returns:
-        result_dict (dictionary): Dictionary with the zinc_id, rbond_matches_set found,
+        dict[dict[set[str]]]:
+        a dictionary with the bond signature as key and the bond information as value.
+        The bond information is a dictionary with the index of the first and second atom
+        of the bond as key and the chemical tag of the corresponding atom as value
 
     """
     # check the chemical dict is not empty
