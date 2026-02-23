@@ -13,7 +13,7 @@ license = { text = "MIT" }
 readme = "README.md"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
 ]
 dependencies = [
@@ -24,14 +24,37 @@ dependencies = [
     "scikit-learn",
     "numba",
     "pooch",
+    "tqdm",
 ]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 
 [project.optional-dependencies]
 dev = [
     "pytest",
     "ruff",
+]
+
+notebook = [
+    "ipython",
+    "jupyter",
+    "notebook",
+    "ipykernel",
+]
+
+viz = [
+    "seaborn",
+    "matplotlib",
+    "plotly",
+]
+
+docs = [
     "mkdocs",
+    "mkdocs-material",
+]
+
+# Convenience group that includes everything
+all = [
+    "smiles_blocks[dev,notebook,viz,docs]",
 ]
 
 [tool.setuptools]
