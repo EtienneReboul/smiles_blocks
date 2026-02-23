@@ -244,7 +244,7 @@ def get_smiles_frag_mapping(smiles: str) -> dict[str, str | dict]:
 
 
 def get_semantic_mem_score(
-    smiles: str, smiles_regex: re.Pattern | str = SmilesRegex.regex
+    smiles: str, smiles_regex: re.Pattern = SmilesRegex.regex
 ) -> np.float64:
     """
     This function will generate a semantic score from a SMILES,
