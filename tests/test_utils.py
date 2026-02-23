@@ -1,3 +1,4 @@
+from multiprocessing import shared_memory
 import time
 
 import pandas as pd
@@ -44,10 +45,10 @@ class TestExportAndRetrieveSharedMemory:
             shm = export_to_shared_memory(name, table)
             assert shm is not None
 
-            retrieved_table = retrieve_sharedmemory(shm.name)
+            retrieved_table = retrieve_sharedmemory(shm)
             assert retrieved_table.equals(table)
         finally:
-            clear_shared_memory(shm.name)
+            clear_shared_memory(shm)
 
     def test_export_with_different_data_types(self):
         table = pa.table(
@@ -57,14 +58,10 @@ class TestExportAndRetrieveSharedMemory:
 
         try:
             shm = export_to_shared_memory(name, table)
-            retrieved_table = retrieve_sharedmemory(shm.name)
+            retrieved_table = retrieve_sharedmemory(shm)
             assert retrieved_table.equals(table)
         finally:
-            clear_shared_memory(shm.name)
-
-    def test_retrieve_nonexistent_shared_memory(self):
-        with pytest.raises(FileNotFoundError):
-            retrieve_sharedmemory("nonexistent_table")
+            clear_shared_memory(shm)
 
 
 class TestClearSharedMemory:
@@ -73,14 +70,9 @@ class TestClearSharedMemory:
         name = "test_clear"
 
         shm = export_to_shared_memory(name, table)
-        clear_shared_memory(shm.name)
-
+        clear_shared_memory(shm)
         with pytest.raises(FileNotFoundError):
-            retrieve_sharedmemory(shm.name)
-
-    def test_clear_nonexistent_shared_memory(self):
-        # Should not raise an exception, only log
-        clear_shared_memory("nonexistent_shm")
+            shared_memory.SharedMemory(name=shm.name)
 
 
 class TestCheckPartitionNotEmpty:

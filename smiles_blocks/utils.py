@@ -113,16 +113,23 @@ def export_to_shared_memory(name: str, table: pa.Table) -> shared_memory.SharedM
     return shm
 
 
-def retrieve_sharedmemory(name: str) -> pa.Table:
+def retrieve_sharedmemory(table_shm: shared_memory.SharedMemory) -> pa.Table:
     """
     Retrieve a PyArrow Table from shared memory.
     This function opens a shared memory buffer by name and reconstructs a PyArrow
     Table from the serialized data stored in that buffer using the Arrow IPC
     (Inter-Process Communication) streaming format.
+
+    Note: The returned table contains zero-copy references to the shared memory buffer.
+    The SharedMemory object is not closed because the table needs access to the buffer.
+    In multiprocessing scenarios, worker processes should not close their handles -
+    the OS will clean them up on process exit. Only the creating process should
+    close and unlink the shared memory.
+
     Parameters
     ----------
-    name : str
-        The name of the shared memory buffer containing the serialized PyArrow Table.
+    table_shm : shared_memory.SharedMemory
+        The shared memory object containing the serialized PyArrow Table.
     Returns
     -------
     pa.Table
@@ -135,7 +142,7 @@ def retrieve_sharedmemory(name: str) -> pa.Table:
         If the shared memory buffer cannot be read or the data cannot be deserialized.
     Examples
     --------
-    >>> table = retrieve_sharedmemory("my_table")
+    >>> table = retrieve_sharedmemory(shm)
     >>> print(table.schema)
     Notes
     -----
@@ -143,23 +150,21 @@ def retrieve_sharedmemory(name: str) -> pa.Table:
     with a serialized PyArrow Table using Arrow's IPC streaming format.
     """
 
-    table_shm = shared_memory.SharedMemory(name=name)
     with pa.ipc.open_stream(pa.py_buffer(table_shm.buf)) as reader:
         table = reader.read_all()
 
     return table
 
 
-def clear_shared_memory(name: str) -> None:
+def clear_shared_memory(shm: shared_memory.SharedMemory) -> None:
     """
-    Clear and unlink a shared memory object by name.
-    This function attempts to access a shared memory object by its name and unlinks it
-    from the system. If any error occurs during this process, it is logged but does not
-    raise an exception, allowing the function to fail gracefully.
+    Clear and unlink a shared memory object.
+    This function closes and unlinks a shared memory object. If any error occurs during this process, it is
+    logged but does not raise an exception, allowing the function to fail gracefully.
     Parameters
     ----------
-    name : str
-        The name of the shared memory object to clear and unlink.
+    shm : shared_memory.SharedMemory
+        The shared memory object to clear and unlink.
     Returns
     -------
     None
@@ -170,17 +175,17 @@ def clear_shared_memory(name: str) -> None:
     Notes
     -----
     This function is non-blocking and will log any errors encountered during the
-    unlink operation without interrupting program execution.
+    cleanup operation without interrupting program execution.
     Examples
     --------
-    >>> clear_shared_memory('my_shared_mem')
+    >>> clear_shared_memory(shm)
     """
 
     try:
-        shm = shared_memory.SharedMemory(name=name)
+        shm.close()
         shm.unlink()
     except Exception as e:
-        logging.error(f"Non blocking error when clearing shared memory '{name}': {e}")
+        logging.error(f"Non blocking error when clearing shared memory '{shm.name}': {e}")
 
 
 def check_partition_not_empty(partition: pd.DataFrame) -> bool:
