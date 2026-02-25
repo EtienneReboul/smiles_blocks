@@ -343,7 +343,7 @@ def get_annotation(
             "end_atom" (str): the chemical tag of the second atom
     """
     # declare local variable
-    annotation_dict: dict[str, str] = {"first_atom": str, "end_atom": str}
+    annotation_dict: dict[str, str] = {"first_atom": "", "end_atom": ""}
 
     # get annotation
     annotation_info = retrosynth[can_atom_idces]
@@ -430,10 +430,10 @@ def get_block_unique_id(block: str) -> dict[str, str | int]:
     """
     # declare local variable
     id_dict = {
-        "can_smiles": str,
-        "first_connected_can_idx": int,
-        "last_connected_can_idx": int,
-        "unique_id": str,
+        "can_smiles": "",
+        "first_connected_can_idx": -1,
+        "last_connected_can_idx": -1,
+        "unique_id": "",
     }
 
     # get the can smiles of the block
@@ -573,6 +573,7 @@ def process_set_smiles(
     # instantiate local variable
     max_matched_bonds = 0
     mem_score_store = -1
+    block_results = None
     threshold_dict = vars(ExtendedRoThreeThreshold())
     blocked_smiles_results = vars(BlockedSmilesResult())
 
