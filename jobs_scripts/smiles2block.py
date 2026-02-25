@@ -16,6 +16,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+from rdkit import RDLogger
 
 from smiles_blocks.files import INTERIM_DATA_DIR, PROCESSED_DATA_DIR, PROJ_ROOT
 from smiles_blocks.retrosynthesis import retrosynthetic_analysis
@@ -94,14 +95,14 @@ def smiles2block_argparse() -> dict:
     parser.add_argument(
         "--output_folder",
         type=str,
-        default=str(INTERIM_DATA_DIR),
+        default=str(INTERIM_DATA_DIR / "well_sampled"),
         help="Path to the output folder where blocks will be saved",
     )
     parser.add_argument(
         "--logfile",
         type=str,
         default="logs/smiles2block.log",
-        help="Path to the log file",
+        help="Path to the log file where the processing logs will be saved",
     )
 
     # compute arguments
@@ -116,6 +117,14 @@ def smiles2block_argparse() -> dict:
         type=int,
         default=10,
         help="Number of batches to process per worker (default: 10)",
+    )
+
+    # RDKit logging level
+    parser.add_argument(
+        "--rdkit-log-level",
+        type=str,
+        default="ERROR",
+        help="Logging level for RDKit (default: ERROR). Options are: DEBUG, INFO, WARNING, ERROR, CRITICAL.",
     )
 
     return vars(parser.parse_args())
@@ -326,6 +335,16 @@ def main():
 
     # parse the arguments
     args = smiles2block_argparse()
+
+    # set RDKit logging level
+    lg = RDLogger.logger()
+    rdkit_log_level = getattr(RDLogger, args["rdkit_log_level"].upper(), None)
+    if rdkit_log_level is not None:
+        lg.setLevel(rdkit_log_level)
+    else:
+        raise ValueError(
+            f"Invalid RDKit log level: {args['rdkit_log_level']}. Valid options are: DEBUG, INFO, WARNING, ERROR, CRITICAL."
+        )
 
     # set up logging
     logging.basicConfig(
