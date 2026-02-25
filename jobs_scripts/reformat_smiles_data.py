@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import time
 
+import pyarrow as pa
 import pyarrow.dataset as ds
 
 from smiles_blocks.files import PROCESSED_DATA_DIR, PROJ_ROOT
@@ -31,6 +32,10 @@ def reformat_argparse() -> dict[str, str | int]:
             Compression format for output files. Options: 'gzip', 'brotli', 'zstd', 'snappy', 'lz4'.
         - compression_level : int
             Compression level (0-11 for brotli).
+        - cpu_threads : int
+            Number of CPU threads for compression operations.
+        - io_threads : int
+            Number of I/O threads for disk operations.
     """
 
     parser = argparse.ArgumentParser(description="Reformat SMILES data")
@@ -74,6 +79,20 @@ def reformat_argparse() -> dict[str, str | int]:
         type=int,
         default=9,
         help="Compression level (0-11 for brotli)",
+    )
+
+    # Add thread configuration options
+    parser.add_argument(
+        "--cpu-threads",
+        type=int,
+        default=4,
+        help="Number of CPU threads for compression (default: 4)",
+    )
+    parser.add_argument(
+        "--io-threads",
+        type=int,
+        default=2,
+        help="Number of I/O threads for disk operations (default: 2)",
     )
 
     return vars(parser.parse_args())
@@ -126,6 +145,17 @@ def main() -> None:
         filename=log_path,
     )
     logger = logging.getLogger(__name__)
+
+    # Configure PyArrow thread pools for optimal compression performance
+    # CPU threads: for brotli compression (CPU intensive)
+    # I/O threads: for disk read/write operations
+    cpu_threads = args["cpu_threads"]
+    io_threads = args["io_threads"]
+    pa.set_cpu_count(cpu_threads)
+    pa.set_io_thread_count(io_threads)
+    logger.info(
+        f"PyArrow thread configuration: CPU threads={cpu_threads}, I/O threads={io_threads}"
+    )
 
     # order files by size
     parquet_list = list(data_path.glob("*.parquet"))
