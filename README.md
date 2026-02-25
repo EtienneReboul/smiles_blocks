@@ -67,8 +67,10 @@ cd smiles_blocks/
 # optional : create and active conda env
 # conda create -n smiles_blocks
 # conda activate smiles_blocks
-pip install .
+pip install .[all]
 ```
+
+The [all] option make sure that you install the optional depencies for ploting, using jupyter notebook, documentation, etc... More advanced user can look through the pyproject.toml to only install the set of dependencies they want.
 
 You should almost be ready to go !
 
@@ -79,6 +81,8 @@ When using cluster, especially clusters with compute canada, best practice is th
 ```bash
 sbatch hpc_scripts/computecanada_narval_test_package_install.sh
 ```
+
+Note that the current install for cluster only install the minimal set of dependencies to run jobs.
 
 ## Download Data
 
@@ -189,6 +193,45 @@ Once  the modelling is done, you can visualize the results with the following no
 # conda activate 
 # conda activate smiles_blocks
 jupyter notebook notebooks/2-er-visualize_modeling_results.ipynb
+```
+
+## (Optional) Generating Canonical Control data
+
+If you whish to reproduce experiment from preprint, you need to generate the fragmentable canonical SMILES for MOSES, i.e SMILES with all bonds explicits. You can do this locally  in ~1 minutes using the appropriate jupyter notebook :
+
+```bash
+# Optional : load the conda environement if you have one
+# conda activate 
+# conda activate smiles_blocks
+jupyter notebook notebooks/4-er-make_canonical_control.ipynb
+```
+
+## Generate blocks and fragmented SMILES libraries
+
+Generating blocks and blocked SMILES for the fully enumerated MOSES can be done locally within 1-2 days of continous compute with the following command :
+
+```bash
+# Optional : load the conda environement if you have one
+# conda activate 
+# conda activate smiles_blocks
+python jobs_scripts/smiles2block.py --input data/processed/smiles_data
+```
+
+Or you can use the following SLURM script to increase the data parallelism with a job array **don't forget to set the proper : #SBATCH --account=your_account** :
+
+```bash
+sbatch hpc_scripts/computecanada_narval_smiles2block.sh
+```
+
+### (optional) Generate control blocks and fragmented SMILES libraries
+
+If you want to reproduce the results of the preprint, you cant do so locally in couple of hours using the following command :
+
+```bash
+# Optional : load the conda environement if you have one
+# conda activate 
+# conda activate smiles_blocks
+python jobs_scripts/smiles2block.py --num_workers 10 --input data/processed/moses_canonical_control/ --output_folder data/interim/moses_canonical_control/ --logfile logs/moses_canonical_control_smiles2block.log --rdkit-log-level CRITICAL
 ```
 
 --------
