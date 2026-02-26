@@ -8,12 +8,10 @@
 #SBATCH --error=logs/reformat_smiles_data/SLURM_err_%A.err
 #SBATCH --job-name="reformat_smiles_data"
 
-module load python/3.12.4 gcc arrow rdkit
+module load python/3.12.4 gcc/12.3 arrow/23.0.1 rdkit/2025.09.4
 virtualenv --no-download $SLURM_TMPDIR/env
 source $SLURM_TMPDIR/env/bin/activate
 
 pip install -e . --no-index
-
-source $SLURM_TMPDIR/env/bin/activate
 
 python jobs_scripts/reformat_smiles_data.py --log_file logs/reformat_smiles_data/reformat_smiles_data.log

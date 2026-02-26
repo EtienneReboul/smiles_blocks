@@ -15,7 +15,7 @@ echo "SLURM job ID: $SLURM_JOB_ID"
 
 # Clean module environment
 module purge
-module load python gcc arrow rdkit
+module load python/3.12.4 gcc/12.3 arrow/23.0.1 rdkit/2025.09.4
 
 # Create virtual environment in node-local storage
 virtualenv --no-download "$SLURM_TMPDIR/env"

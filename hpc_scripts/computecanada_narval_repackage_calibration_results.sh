@@ -8,13 +8,12 @@
 #SBATCH --error=logs/repackaging_calibration/SLURM_err_%A.err
 #SBATCH --job-name="repackaging_calibration"
 
-module load python gcc arrow rdkit
+module load python/3.12.4 gcc/12.3 arrow/23.0.1 rdkit/2025.09.4
 virtualenv --no-download $SLURM_TMPDIR/env
 source $SLURM_TMPDIR/env/bin/activate
 
 pip install -e . --no-index
 
-source $SLURM_TMPDIR/env/bin/activate
 
 # Run the repackaging script
 python jobs_scripts/repackage_calibration_results.py --log_path logs/repackaging_calibration/repackage_calibration_results.log
