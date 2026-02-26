@@ -175,7 +175,10 @@ def main() -> None:
     # Process each batch of files
     for i, batch in enumerate(packed_parquet):
         # log batch processing
-        batch_files = ", ".join(file.name for file in batch)
+        if isinstance(batch, tuple) or isinstance(batch, list):
+            batch_files = ", ".join(file.name for file in batch)
+        elif isinstance(batch, Path):
+            batch_files = batch.name
         logger.info(f"Processing batch {i} with files: {batch_files}")
 
         # setup loop variables
