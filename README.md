@@ -60,7 +60,9 @@ To get started with this project, first clone the repository to your local machi
 git clone https://github.com/EtienneReboul/smiles_blocks.git
 ```
 
-Use pip to install smiles_block package using the pyproject.toml :
+Use pip to install smiles_block package using the pyproject.toml  :
+
+For Linux (bash) :
 
 ```bash
 cd smiles_blocks/
@@ -68,6 +70,16 @@ cd smiles_blocks/
 # conda create -n smiles_blocks
 # conda activate smiles_blocks
 pip install .[all]
+```
+
+For MacOs (zsh):
+
+```zsh
+cd smiles_blocks/
+# optional : create and active conda env
+# conda create -n smiles_blocks
+# conda activate smiles_blocks
+pip install ".[all]"
 ```
 
 The [all] option make sure that you install the optional depencies for ploting, using jupyter notebook, documentation, etc... More advanced user can look through the pyproject.toml to only install the set of dependencies they want.
