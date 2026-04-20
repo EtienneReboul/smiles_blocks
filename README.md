@@ -246,4 +246,17 @@ If you want to reproduce the results of the preprint, you cant do so locally in 
 python jobs_scripts/smiles2block.py --num_workers 10 --input data/processed/moses_canonical_control/ --output_folder data/interim/moses_canonical_control/ --logfile logs/moses_canonical_control_smiles2block.log --rdkit-log-level CRITICAL
 ```
 
+### (optional) Generate the paper figure from notebook 5
+
+The figure used in the fragmentation results section of the paper can be regenerated from the Jupyter notebook [notebooks/5-er-smiles_fragmentation_results_analysis.ipynb](notebooks/5-er-smiles_fragmentation_results_analysis.ipynb). Open the notebook in Jupyter and run all cells from top to bottom. The notebook reads the blocked SMILES results from `data/interim/`, computes the summary statistics, and saves the figure to [reports/figures/fragmentation_results/](reports/figures/fragmentation_results/).
+
+If you want to launch it from the command line, use:
+
+```bash
+# Optional : load the conda environement if you have one
+# conda activate 
+# conda activate smiles_blocks
+jupyter notebook notebooks/5-er-smiles_fragmentation_results_analysis.ipynb
+```
+
 --------
