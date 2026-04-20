@@ -18,6 +18,7 @@ References:
      - Updated by Leili Zhang, Vasu Rao, Jul 2022
 """
 
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 _DISCLAIMER = """
@@ -242,5 +243,76 @@ class RBRICSRetrosynthesisBound:
             "L20-L21": "[$([CH2][CH2][CH2][CH3,RC,c,$(C(~[!#6]))])]-[$([CH2][CH2][CH2][CH2][CH3,RC,c,$(C(~[!#6]))])]",
             "L22-L23": "[$([CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH3,RC,c,$(C(~[!#6]))])]-[$([CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH2][CH3,RC,c,$(C(~[!#6]))])]",
         }
+    )
+    disclaimer = _DISCLAIMER
+
+
+@dataclass
+class RBRICSCompatibilityMap:
+    patterns: defaultdict[str, set[str]] = field(
+        default_factory=lambda: defaultdict(
+            set,
+            {
+                "L1": {"L10", "L3", "L5"},
+                "L30": {
+                    "L10",
+                    "L11",
+                    "L12",
+                    "L12b",
+                    "L13",
+                    "L14",
+                    "L14b",
+                    "L15",
+                    "L16",
+                    "L16b",
+                    "L30",
+                    "L4",
+                    "L5",
+                    "L51",
+                    "L6",
+                    "L81",
+                    "L9",
+                },
+                "L3": {"L13", "L14", "L14b", "L15", "L16", "L16b", "L4"},
+                "L4": {"L11", "L5"},
+                "L5": {"L12", "L13", "L14", "L14b", "L15", "L16", "L16b"},
+                "L51": {"L1", "L12", "L12b", "L13", "L14", "L14b", "L15", "L16", "L16b", "L4"},
+                "L6": {"L13", "L14", "L14b", "L15", "L16", "L16b"},
+                "L7a": {"L7b"},
+                "L8": {"L10", "L13", "L14", "L14b", "L15", "L16", "L16b", "L9"},
+                "L81": {"L10", "L13", "L14", "L14b", "L15", "L16", "L16b", "L8", "L9"},
+                "L9": {"L13", "L14", "L14b", "L15", "L16", "L16b"},
+                "L10": {"L13", "L14", "L14b", "L15", "L16", "L16b"},
+                "L11": {"L13", "L14", "L14b", "L15", "L16", "L16b"},
+                "L12b": {"L12b", "L13", "L14", "L14b", "L15", "L16", "L16b", "L4", "L5"},
+                "L13": {"L14", "L14b", "L15", "L16", "L16b"},
+                "L14": {"L14", "L14b", "L15", "L16"},
+                "L14b": {"L14b", "L15", "L16", "L16b", "L17"},
+                "L15": {"L16", "L16b"},
+                "L16": {"L16", "L16b"},
+                "L16b": {"L16b"},
+                "L17": {
+                    "L10",
+                    "L11",
+                    "L12",
+                    "L12b",
+                    "L13",
+                    "L14",
+                    "L15",
+                    "L16",
+                    "L16b",
+                    "L17",
+                    "L5",
+                    "L51",
+                    "L8",
+                    "L81",
+                    "L9",
+                },
+                "L18": {"L19"},
+                "L182": {"L192"},
+                "L20": {"L21"},
+                "L22": {"L23"},
+            },
+        )
     )
     disclaimer = _DISCLAIMER

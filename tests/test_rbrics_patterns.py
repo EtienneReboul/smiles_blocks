@@ -1,4 +1,10 @@
-from smiles_blocks.rbrics_patterns import RBRICSChemicalGroups, RBRICSRetrosynthesisBound
+from collections import defaultdict
+
+from smiles_blocks.rbrics_patterns import (
+    RBRICSChemicalGroups,
+    RBRICSCompatibilityMap,
+    RBRICSRetrosynthesisBound,
+)
 
 
 class TestRBRICSChemicalGroups:
@@ -160,6 +166,49 @@ class TestRBRICSRetrosynthesisBound:
             assert value.strip(), f"Empty pattern value for {key}"
 
 
+class TestRBRICSCompatibilityMap:
+    """Tests for RBRICSCompatibilityMap dataclass."""
+
+    def test_initialization(self):
+        """Test that RBRICSCompatibilityMap initializes with default patterns."""
+        compatibility_map = RBRICSCompatibilityMap()
+        assert compatibility_map.patterns is not None
+        assert isinstance(compatibility_map.patterns, defaultdict)
+
+    def test_patterns_not_empty(self):
+        """Test that compatibility map dictionary is not empty."""
+        compatibility_map = RBRICSCompatibilityMap()
+        assert len(compatibility_map.patterns) > 0
+
+    def test_expected_keys_present(self):
+        """Test that known compatibility keys are present."""
+        compatibility_map = RBRICSCompatibilityMap()
+        expected_keys = {"L1", "L30", "L12b", "L17", "L22"}
+        assert expected_keys.issubset(compatibility_map.patterns.keys())
+
+    def test_values_are_sets_of_strings(self):
+        """Test that compatibility values are sets containing string labels."""
+        compatibility_map = RBRICSCompatibilityMap()
+        for key, value in compatibility_map.patterns.items():
+            assert isinstance(key, str)
+            assert isinstance(value, set)
+            assert all(isinstance(label, str) for label in value)
+
+    def test_defaultdict_returns_empty_set_for_missing_key(self):
+        """Test that missing keys produce an empty set from defaultdict."""
+        compatibility_map = RBRICSCompatibilityMap()
+        missing_value = compatibility_map.patterns["L_DOES_NOT_EXIST"]
+        assert isinstance(missing_value, set)
+        assert missing_value == set()
+
+    def test_disclaimer_present(self):
+        """Test that disclaimer is present."""
+        compatibility_map = RBRICSCompatibilityMap()
+        assert compatibility_map.disclaimer is not None
+        assert isinstance(compatibility_map.disclaimer, str)
+        assert "Copyright" in compatibility_map.disclaimer
+
+
 class TestDataclassDefaults:
     """Tests for dataclass default factory behavior."""
 
@@ -176,3 +225,10 @@ class TestDataclassDefaults:
         bounds2 = RBRICSRetrosynthesisBound()
         assert bounds1.patterns is not bounds2.patterns
         assert bounds1.patterns == bounds2.patterns
+
+    def test_compatibility_map_multiple_instances_independent(self):
+        """Test that multiple compatibility map instances have independent dictionaries."""
+        compatibility_map1 = RBRICSCompatibilityMap()
+        compatibility_map2 = RBRICSCompatibilityMap()
+        assert compatibility_map1.patterns is not compatibility_map2.patterns
+        assert compatibility_map1.patterns == compatibility_map2.patterns
