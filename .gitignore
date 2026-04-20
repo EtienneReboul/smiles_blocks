@@ -6,6 +6,9 @@
 # vscode settings
 .vscode/
 
+# pyright config
+pyrightconfig.json
+
 # Mac OS-specific storage files
 .DS_Store
 
