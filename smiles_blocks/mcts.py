@@ -5,7 +5,7 @@ Monte Carlo Tree Search module for de novo drug design using R-BRICS fragments.
 
 Fragment table schema expected
 -------------------------------
-block, can_smiles, first_connected_can_idx, last_connected_can_idx,
+block, block, first_connected_can_idx, last_connected_can_idx,
 unique_id, begin_tag, end_tag, MolWt, nHDonors, nHAcceptors,
 nRotatableBonds, CrippenlogP, TPSA, status
 
@@ -115,19 +115,20 @@ class FragmentLibrary:
     def __init__(self, df: pd.DataFrame, compatibility_map: Optional[dict] = None):
         self.df = df.copy()
         self.compatibility_map = compatibility_map or dict(RBRICSCompatibilityMap().patterns)
+        self._empty = self.df.iloc[0:0].copy()
         self._by_begin: dict[str, pd.DataFrame] = {
             str(tag): grp.reset_index(drop=True) for tag, grp in self.df.groupby("begin_tag")
         }
 
     def get_start_fragments(self) -> pd.DataFrame:
         """Fragments with begin_tag == 'no_tag'  (chain roots)."""
-        return self._by_begin.get("no_tag", pd.DataFrame())
+        return self._by_begin.get("no_tag", self._empty)
 
     def get_compatible_extensions(self, end_tag: str) -> pd.DataFrame:
         """All fragments whose begin_tag is compatible with *end_tag*."""
         compat = self.compatibility_map.get(end_tag, set())
         frames = [self._by_begin[t] for t in compat if t in self._by_begin]
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return pd.concat(frames, ignore_index=True) if frames else self._empty
 
     def get_terminal_fragments(self, end_tag: str) -> pd.DataFrame:
         """Compatible extensions that also close the chain (end_tag == 'no_tag')."""
@@ -163,7 +164,7 @@ class MolState:
 
     def assembled_smiles(self) -> str:
         # ---- Replace this with your ligation / attachment-point logic ----
-        return ".".join(self.smiles_parts)
+        return "".join(self.smiles_parts)
 
     def to_mol(self) -> Optional[Chem.Mol]:
         smi = self.assembled_smiles()
@@ -378,7 +379,7 @@ class MCTSDrugDesign:
             return node
         new_state = node.state.clone()
         new_state.fragment_ids.append(row["unique_id"])
-        new_state.smiles_parts.append(row["can_smiles"])
+        new_state.smiles_parts.append(row["block"])
         new_state.current_end_tag = row["end_tag"]
         child = MCTSNode(state=new_state, parent=node, fragment_row=row)
         node.children.append(child)
@@ -402,7 +403,7 @@ class MCTSDrugDesign:
                 break
             row = cands.sample(1).iloc[0]
             state.fragment_ids.append(row["unique_id"])
-            state.smiles_parts.append(row["can_smiles"])
+            state.smiles_parts.append(row["block"])
             state.current_end_tag = row["end_tag"]
         return state
 
