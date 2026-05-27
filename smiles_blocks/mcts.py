@@ -385,7 +385,9 @@ class FragmentLibrary:
         # _cond_uid_to_row[uid]: int          row index in self.table
         # _rows_by_uid[uid]    : dict         pre-materialised row for O(1) lookup
         self._cond_next_ids: dict[str, list] = {}
-        self._cond_cdf: dict[str, "np.ndarray"] = {}
+        self._cond_cdf: dict[str, np.ndarray] = {}
+        self._cond_terminal_mask: dict[str, np.ndarray] = {}  # bool mask, pre-cached
+        self._cond_terminal_cdf: dict[str, Optional[np.ndarray]] = {}  # sub-CDF for terminal draw
         self._cond_uid_to_row: dict[str, int] = {
             uid: i for i, uid in enumerate(table.column("unique_id").to_pylist())
         }
@@ -448,8 +450,24 @@ class FragmentLibrary:
             if temperature != 1.0:
                 probas = probas.clip(1e-12) ** (1.0 / temperature)
             probas /= probas.sum()
-            self._cond_next_ids[str(uid)] = nids
-            self._cond_cdf[str(uid)] = probas.cumsum()
+
+            uid_str = str(uid)
+            self._cond_next_ids[uid_str] = nids
+            self._cond_cdf[uid_str] = probas.cumsum()
+
+            # Pre-cache terminal mask and terminal sub-CDF so sample_conditional
+            # never rebuilds them on the hot path (terminal_only=True path).
+            t_mask = np.array(
+                [self._rows_by_uid.get(nid, {}).get("end_tag") == "no_tag" for nid in nids],
+                dtype=bool,
+            )
+            self._cond_terminal_mask[uid_str] = t_mask
+            if t_mask.any():
+                sub_p = probas[t_mask]
+                sub_p = sub_p / sub_p.sum()
+                self._cond_terminal_cdf[uid_str] = sub_p.cumsum()
+            else:
+                self._cond_terminal_cdf[uid_str] = None
 
     def sample_conditional(
         self,
@@ -468,8 +486,6 @@ class FragmentLibrary:
         current_uid   : unique_id of the last fragment in the partial chain.
         terminal_only : restrict to fragments with end_tag == 'no_tag'.
         """
-        import numpy as _np
-
         if current_uid not in self._cond_next_ids:
             return None
 
@@ -477,27 +493,24 @@ class FragmentLibrary:
         cdf = self._cond_cdf[current_uid]
 
         if terminal_only:
-            terminal_mask = _np.array(
-                [self._rows_by_uid.get(nid, {}).get("end_tag") == "no_tag" for nid in next_ids],
-                dtype=bool,
-            )
-            if not terminal_mask.any():
+            # Use pre-cached terminal mask and sub-CDF — zero list comprehension
+            t_mask = self._cond_terminal_mask.get(current_uid)
+            t_cdf = self._cond_terminal_cdf.get(current_uid)
+            if t_mask is None or not t_mask.any():
                 return None
-            t_indices = _np.where(terminal_mask)[0]
+            t_indices = np.where(t_mask)[0]
             if len(t_indices) == 1:
                 chosen_uid = next_ids[int(t_indices[0])]
+            elif t_cdf is not None:
+                chosen_uid = next_ids[t_indices[self._searchsorted_sample(t_cdf)]]
             else:
-                all_prob = _np.diff(_np.concatenate([[0.0], cdf]))
-                sub_prob = all_prob[terminal_mask]
-                sub_prob /= sub_prob.sum()
-                chosen_uid = next_ids[t_indices[self._searchsorted_sample(sub_prob.cumsum())]]
+                return None
         else:
             chosen_uid = next_ids[self._searchsorted_sample(cdf)]
 
-        row_idx = self._cond_uid_to_row.get(chosen_uid)
-        if row_idx is None:
-            return None
-        return {col: self.table.column(col)[row_idx].as_py() for col in self._ROW_COLS}
+        # Use pre-materialised row dict — zero Arrow overhead
+        row = self._rows_by_uid.get(chosen_uid)
+        return row  # None if chosen_uid not in fragment table
 
         # ------------------------------------------------------------------
 
