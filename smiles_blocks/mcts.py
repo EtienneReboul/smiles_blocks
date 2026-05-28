@@ -9,7 +9,7 @@ block, can_smiles, first_connected_can_idx, last_connected_can_idx,
 unique_id, begin_tag, end_tag, MolWt, nHDonors, nHAcceptors,
 nRotatableBonds, CrippenlogP, TPSA, frequency, status
 
-Performance optimisations applied (v7)
+Performance optimisations applied (v8)
 ---------------------------------------
 1. Pool draining    : zero-weight numpy array instead of Arrow slice+concat
                       (~19x speedup on expand)
@@ -32,6 +32,8 @@ Performance optimisations applied (v7)
 11. Conditional prior: true corpus transition probabilities P(a|s) used
                       instead of marginal log-frequency prior when available;
                       falls back to marginal prior for unseen parent fragments
+12. Soft scoring     : sa_score_component and qed_component now return
+                      soft gradients instead of binary gates
 
 Usage
 -----
@@ -60,7 +62,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.ipc as ipc
 from rdkit import Chem
-from rdkit.Chem import Descriptors, rdMolDescriptors
+from rdkit.Chem import QED, Descriptors, rdMolDescriptors
 from rdkit.Contrib.SA_Score import sascorer  # pyright: ignore[reportMissingImports]
 
 from smiles_blocks.rbrics_patterns import RBRICSCompatibilityMap
@@ -165,47 +167,132 @@ def lipinski_score(mol: Chem.Mol) -> float:
 
 
 def sa_score_component(mol: Chem.Mol, threshold: float = 4.4) -> float:
-    """Returns 1.0 if SA-score <= threshold, else 0.0."""
-    return 1.0 if sascorer.calculateScore(mol) <= threshold else 0.0
+    """
+    Soft SA component — linear gradient between threshold and 1.0.
+
+    SA score is inverted: lower = easier to synthesise.
+      SA > threshold : 0.0  (too hard to synthesise)
+      SA = threshold : 0.0  (just at the cutoff)
+      SA = 1.0       : 1.0  (trivially easy)
+
+    Gives the search a continuous signal to prefer more synthesisable
+    fragments rather than a binary cliff at the threshold.
+    """
+    sa = sascorer.calculateScore(mol)
+    if sa > threshold:
+        return 0.0
+    return (threshold - sa) / (threshold - 1.0)
+
+
+def qed_component(mol: Chem.Mol, threshold: float = 0.7) -> float:
+    """
+    Soft QED component — linear gradient between threshold and 1.0.
+
+      QED < threshold : 0.0  (below drug-likeness cutoff)
+      QED = threshold : 0.0  (just at the cutoff)
+      QED = 1.0       : 1.0  (perfect drug-likeness)
+
+    Gives the search a continuous signal to prefer higher QED rather
+    than a binary pass/fail gate at the threshold.
+    """
+    q = QED.qed(mol)
+    if q < threshold:
+        return 0.0
+    return (q - threshold) / (1.0 - threshold)
 
 
 def composite_score(
     mol: Chem.Mol,
     sa_threshold: float = 4.4,
-    lipinski_weight: float = 0.7,
-    sa_weight: float = 0.3,
+    qed_threshold: float = 0.7,
+    lipinski_weight: float = 0.5,
+    sa_weight: float = 0.25,
+    qed_weight: float = 0.25,
 ) -> float:
+    """
+    Weighted composite of three soft drug-likeness components.
+
+      Lipinski (0.5) : soft gate — 0.25 subtracted per violated rule
+      SA score (0.25): soft gradient — linear from 0 at threshold to 1 at SA=1
+      QED      (0.25): soft gradient — linear from 0 at threshold to 1 at QED=1
+
+    Weights sum to 1.0 so the maximum possible score is always 1.0.
+    """
     if mol is None:
         return 0.0
-    return lipinski_weight * lipinski_score(mol) + sa_weight * sa_score_component(
-        mol, threshold=sa_threshold
+    return (
+        lipinski_weight * lipinski_score(mol)
+        + sa_weight * sa_score_component(mol, threshold=sa_threshold)
+        + qed_weight * qed_component(mol, threshold=qed_threshold)
     )
 
 
 class _CompositeScorer:
     """Picklable composite scorer (spawn-safe on Windows/macOS)."""
 
-    def __init__(self, lw: float, sw: float, sa_thresh: float):
-        self.lw, self.sw, self.sa_thresh = lw, sw, sa_thresh
+    def __init__(
+        self,
+        lw: float,
+        sw: float,
+        qw: float,
+        sa_thresh: float,
+        qed_thresh: float,
+    ):
+        self.lw = lw
+        self.sw = sw
+        self.qw = qw
+        self.sa_thresh = sa_thresh
+        self.qed_thresh = qed_thresh
 
     def __call__(self, mol: Chem.Mol) -> float:
-        return composite_score(mol, self.sa_thresh, self.lw, self.sw)
+        return composite_score(
+            mol,
+            sa_threshold=self.sa_thresh,
+            qed_threshold=self.qed_thresh,
+            lipinski_weight=self.lw,
+            sa_weight=self.sw,
+            qed_weight=self.qw,
+        )
 
 
 def make_composite_scorer(
-    lipinski_weight: float = 0.7,
-    sa_weight: float = 0.3,
+    lipinski_weight: float = 0.5,
+    sa_weight: float = 0.25,
+    qed_weight: float = 0.25,
     sa_threshold: float = 4.4,
+    qed_threshold: float = 0.7,
 ) -> _CompositeScorer:
     """
     Factory returning a picklable composite scorer.
 
+    Default weights: Lipinski 0.5 | SA 0.25 | QED 0.25  (sum = 1.0)
+
+    All three components use soft gradients so MCTS has a continuous
+    reward signal to climb rather than binary pass/fail cliffs:
+      - Lipinski: loses 0.25 per violated rule (soft gate, 0 to 1)
+      - SA score: linear 0 -> 1 from threshold down to SA=1.0
+      - QED:      linear 0 -> 1 from threshold up to QED=1.0
+
+    Parameters
+    ----------
+    lipinski_weight : float   Weight for the Lipinski component (default 0.5).
+    sa_weight       : float   Weight for the SA component (default 0.25).
+    qed_weight      : float   Weight for the QED component (default 0.25).
+    sa_threshold    : float   SA score cutoff (default 4.4).
+    qed_threshold   : float   QED minimum threshold (default 0.7).
+
     >>> scorer = make_composite_scorer()
     >>> mcts   = MCTSDrugDesign(table, score_fn=scorer)
     """
-    if abs(lipinski_weight + sa_weight - 1.0) > 1e-6:
-        raise ValueError("Weights must sum to 1.0")
-    return _CompositeScorer(lipinski_weight, sa_weight, sa_threshold)
+    if abs(lipinski_weight + sa_weight + qed_weight - 1.0) > 1e-6:
+        raise ValueError("lipinski_weight + sa_weight + qed_weight must sum to 1.0")
+    return _CompositeScorer(
+        lipinski_weight,
+        sa_weight,
+        qed_weight,
+        sa_threshold,
+        qed_threshold,
+    )
 
 
 # ============================================================
