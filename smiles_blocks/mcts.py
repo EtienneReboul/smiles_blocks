@@ -9,7 +9,7 @@ block, can_smiles, first_connected_can_idx, last_connected_can_idx,
 unique_id, begin_tag, end_tag, MolWt, nHDonors, nHAcceptors,
 nRotatableBonds, CrippenlogP, TPSA, frequency, status
 
-Performance optimisations applied (v10)
+Performance optimisations applied (v11)
 ---------------------------------------
 1. Pool draining    : zero-weight numpy array instead of Arrow slice+concat
 2. Index selection  : searchsorted on pre-built CDF instead of np.random.choice(p=)
@@ -34,6 +34,8 @@ Performance optimisations applied (v10)
 14. Zero-Arrow expand: _pool() pre-materialises all candidate rows as
                       plain Python dicts at node creation time; pop_untried
                       returns from a list lookup with zero .as_py() calls
+15. Minimal MolState : 4 scalars + immutable uid tuple; clone() is O(1);
+                      SMILES assembled once at leaf via _rows_by_uid
 
 Usage
 -----
@@ -47,7 +49,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
 import logging
 import math
 from multiprocessing.shared_memory import SharedMemory
@@ -615,16 +616,23 @@ class FragmentLibrary:
 # ============================================================
 
 
-@dataclass
 class MolState:
-    fragment_ids: list = field(default_factory=list)
-    smiles_parts: list = field(default_factory=list)
-    current_end_tag: str = "no_tag"
-    target_n_blocks: int = 1
+    """
+    Minimal molecule assembly state — optimised for the MCTS hot path.
 
-    @property
-    def n_blocks(self) -> int:
-        return len(self.fragment_ids)
+    Only four scalars + one immutable tuple are carried per node.
+    clone() is O(1) with zero copies. SMILES is assembled once at the
+    leaf via lib._rows_by_uid — no string accumulation mid-search.
+    """
+
+    __slots__ = ("current_end_tag", "last_uid", "n_blocks", "target_n_blocks", "_uid_chain")
+
+    def __init__(self, target_n_blocks: int = 1) -> None:
+        self.current_end_tag: str = "no_tag"
+        self.last_uid: str = ""
+        self.n_blocks: int = 0
+        self.target_n_blocks: int = target_n_blocks
+        self._uid_chain: tuple = ()
 
     @property
     def is_complete(self) -> bool:
@@ -634,21 +642,35 @@ class MolState:
             and self.current_end_tag == "no_tag"
         )
 
-    def assembled_smiles(self) -> str:
-        return "".join(self.smiles_parts)
-
-    def to_mol(self) -> Optional[Chem.Mol]:
-        smi = self.assembled_smiles()
-        return Chem.MolFromSmiles(smi) if smi else None
+    def append(self, row: dict) -> None:
+        """Extend the chain with one fragment row — O(1) scalar updates."""
+        self._uid_chain = self._uid_chain + (row["unique_id"],)
+        self.last_uid = row["unique_id"]
+        self.current_end_tag = row["end_tag"]
+        self.n_blocks += 1
 
     def clone(self) -> "MolState":
-        """Fast clone — explicit list copies, ~10-30x faster than deepcopy."""
+        """O(1) true clone — tuple shared by reference, zero copies."""
         s = MolState.__new__(MolState)
-        s.fragment_ids = self.fragment_ids.copy()
-        s.smiles_parts = self.smiles_parts.copy()
         s.current_end_tag = self.current_end_tag
+        s.last_uid = self.last_uid
+        s.n_blocks = self.n_blocks
         s.target_n_blocks = self.target_n_blocks
+        s._uid_chain = self._uid_chain
         return s
+
+    def assembled_smiles(self, lib: "FragmentLibrary") -> str:
+        """Materialise SMILES at leaf time — zero Arrow .as_py() calls."""
+        return "".join(lib._rows_by_uid[uid]["block"] for uid in self._uid_chain)
+
+    def to_mol(self, lib: "FragmentLibrary") -> Optional[Chem.Mol]:
+        smi = self.assembled_smiles(lib)
+        return Chem.MolFromSmiles(smi) if smi else None
+
+    @property
+    def fragment_ids(self) -> list:
+        """Compatibility shim — uid chain as a list."""
+        return list(self._uid_chain)
 
 
 # ============================================================
@@ -833,10 +855,10 @@ class MCTSNode:
         """
         Sample one fragment from the untried pool.
 
-        Uses pre-materialised _pool_rows — zero Arrow .as_py() in the hot path.
-        Index selection via searchsorted on the lazy-rebuilt CDF.
+        One Arrow .as_py() call to read the unique_id, then O(1) lookup
+        in lib._rows_by_uid (pre-materialised Python dict) for the full row.
         """
-        self._pool(lib, profiler)  # ensure pool is initialised
+        self._pool(lib, profiler)
         if self._pool_size == 0 or self._untried_w is None:
             return None
         total = self._untried_w.sum()
@@ -852,8 +874,9 @@ class MCTSNode:
         )
         self._untried_w[idx] = 0.0
         self._untried_dirty = True
-        # Direct list lookup — pure Python, zero Arrow overhead
-        return self._pool_rows[idx]  # pyright: ignore[reportOptionalSubscript]
+        # One Arrow scalar read for uid, then O(1) pre-materialised dict lookup
+        uid = self._pool_table.column("unique_id")[idx].as_py()  # pyright: ignore[reportOptionalMemberAccess]
+        return lib._rows_by_uid.get(uid)
 
     def add_dirichlet_noise(self, alpha: float = 0.3, epsilon: float = 0.25) -> None:
         if self._prior is None or len(self.children) == 0:
@@ -924,9 +947,7 @@ def _expand(
     if profiler:
         profiler.start("expand_clone")
     new_state = node.state.clone()
-    new_state.fragment_ids.append(row["unique_id"])
-    new_state.smiles_parts.append(row["block"])
-    new_state.current_end_tag = row["end_tag"]
+    new_state.append(row)
     if profiler:
         profiler.stop("expand_clone")
     if profiler:
@@ -987,7 +1008,7 @@ def _simulate(
             break
         if profiler:
             profiler.start("library_query")
-        last_uid = state.fragment_ids[-1] if state.fragment_ids else None
+        last_uid = state.last_uid if state.n_blocks > 0 else None
         if remaining == 1:
             row = (
                 lib.sample_conditional(last_uid, terminal_only=True)
@@ -1018,9 +1039,7 @@ def _simulate(
             profiler.stop("library_query")
         if row is None:
             break
-        state.fragment_ids.append(row["unique_id"])
-        state.smiles_parts.append(row["block"])
-        state.current_end_tag = row["end_tag"]
+        state.append(row)
     if profiler:
         profiler.stop("simulate")
     return state
@@ -1029,11 +1048,12 @@ def _simulate(
 def _score_state(
     state: MolState,
     score_fn,
+    lib: "FragmentLibrary",
     profiler: Optional[MCTSProfiler] = None,
 ) -> float:
     if profiler:
         profiler.start("score")
-    mol = state.to_mol()
+    mol = state.to_mol(lib)
     reward = score_fn(mol) if mol else 0.0
     if profiler:
         profiler.stop("score")
@@ -1043,6 +1063,7 @@ def _score_state(
 def _score_states_batch(
     states: list,
     score_fn,
+    lib: "FragmentLibrary",
     n_threads: int,
     profiler: Optional[MCTSProfiler] = None,
 ) -> list:
@@ -1054,7 +1075,7 @@ def _score_states_batch(
         profiler.start("score_batch")
 
     def _score_one(state):
-        mol = state.to_mol()
+        mol = state.to_mol(lib)
         return score_fn(mol) if mol else 0.0
 
     with ThreadPoolExecutor(max_workers=n_threads) as pool:
@@ -1135,10 +1156,10 @@ def _search_one(args: tuple) -> tuple[list[dict], dict]:
             terminal_state = _simulate(
                 node.state.clone(), library, rollout_depth, temperature, profiler
             )
-            reward = _score_state(terminal_state, score_fn, profiler)
+            reward = _score_state(terminal_state, score_fn, library, profiler)
             _backpropagate(node, reward, profiler)
             if terminal_state.is_complete and reward >= score_threshold:
-                smi = terminal_state.assembled_smiles()
+                smi = terminal_state.assembled_smiles(library)
                 if smi not in seen_smiles:
                     seen_smiles.add(smi)
                     collected.append(
@@ -1146,7 +1167,7 @@ def _search_one(args: tuple) -> tuple[list[dict], dict]:
                             "smiles": smi,
                             "score": reward,
                             "n_blocks": terminal_state.n_blocks,
-                            "fragment_ids": list(terminal_state.fragment_ids),
+                            "fragment_ids": list(terminal_state._uid_chain),
                         }
                     )
     else:
@@ -1154,11 +1175,13 @@ def _search_one(args: tuple) -> tuple[list[dict], dict]:
         buffer_states: list = []
 
         def _flush():
-            rewards = _score_states_batch(buffer_states, score_fn, score_batch_size, profiler)
+            rewards = _score_states_batch(
+                buffer_states, score_fn, library, score_batch_size, profiler
+            )
             for nd, ts, rw in zip(buffer_nodes, buffer_states, rewards):
                 _backpropagate(nd, rw, profiler)
                 if ts.is_complete and rw >= score_threshold:
-                    smi = ts.assembled_smiles()
+                    smi = ts.assembled_smiles(library)
                     if smi not in seen_smiles:
                         seen_smiles.add(smi)
                         collected.append(
@@ -1166,7 +1189,7 @@ def _search_one(args: tuple) -> tuple[list[dict], dict]:
                                 "smiles": smi,
                                 "score": rw,
                                 "n_blocks": ts.n_blocks,
-                                "fragment_ids": list(ts.fragment_ids),
+                                "fragment_ids": list(ts._uid_chain),
                             }
                         )
             buffer_nodes.clear()
@@ -1394,10 +1417,10 @@ class MCTSDrugDesign:
                     temperature,
                     self.profiler,
                 )
-                reward = _score_state(terminal_state, self.score_fn, self.profiler)
+                reward = _score_state(terminal_state, self.score_fn, self.library, self.profiler)
                 _backpropagate(node, reward, self.profiler)
                 if terminal_state.is_complete and reward >= score_threshold:
-                    smi = terminal_state.assembled_smiles()
+                    smi = terminal_state.assembled_smiles(self.library)
                     if smi not in seen_smiles:
                         seen_smiles.add(smi)
                         collected.append(
@@ -1405,7 +1428,7 @@ class MCTSDrugDesign:
                                 "smiles": smi,
                                 "score": reward,
                                 "n_blocks": terminal_state.n_blocks,
-                                "fragment_ids": list(terminal_state.fragment_ids),
+                                "fragment_ids": list(terminal_state._uid_chain),
                             }
                         )
         else:
@@ -1416,13 +1439,13 @@ class MCTSDrugDesign:
                 rewards = _score_states_batch(
                     buffer_states,
                     self.score_fn,
-                    self.score_batch_size,
-                    self.profiler,
+                    self.score_batch_size,  # pyright: ignore[reportArgumentType]
+                    self.profiler,  # pyright: ignore[reportArgumentType]
                 )
                 for nd, ts, rw in zip(buffer_nodes, buffer_states, rewards):
                     _backpropagate(nd, rw, self.profiler)
                     if ts.is_complete and rw >= score_threshold:
-                        smi = ts.assembled_smiles()
+                        smi = ts.assembled_smiles(self.library)
                         if smi not in seen_smiles:
                             seen_smiles.add(smi)
                             collected.append(
@@ -1430,7 +1453,7 @@ class MCTSDrugDesign:
                                     "smiles": smi,
                                     "score": rw,
                                     "n_blocks": ts.n_blocks,
-                                    "fragment_ids": list(ts.fragment_ids),
+                                    "fragment_ids": list(ts._uid_chain),
                                 }
                             )
                 buffer_nodes.clear()
