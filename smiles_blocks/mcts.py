@@ -9,33 +9,40 @@ block, can_smiles, first_connected_can_idx, last_connected_can_idx,
 unique_id, begin_tag, end_tag, MolWt, nHDonors, nHAcceptors,
 nRotatableBonds, CrippenlogP, TPSA, frequency, status
 
-Performance optimisations applied (v11)
+Performance optimisations applied (v12)
 ---------------------------------------
-1. Pool draining    : zero-weight numpy array instead of Arrow slice+concat
-2. Index selection  : searchsorted on pre-built CDF instead of np.random.choice(p=)
-3. Weight building  : pre-cached log-frequency numpy arrays per tag group
-4. Row reads        : pre-materialised Python lists per tag group
-5. Incremental prior: (FIX A) PUCT prior updated by appending one value and
-                      renormalising — no full vector rebuild per expansion
-6. Cached group CDFs: (FIX B) sample_compatible stage-1 uses pre-built per-end_tag
-                      CDF arrays — no list comprehension or sum() in rollout
-7. Fast clone       : explicit list.copy() instead of deepcopy in MolState.clone()
-8. Lazy CDF rebuild : pop_untried skips CDF recompute on the first draw
-9. Expand sub-timers: expand_pop / expand_clone / expand_node / expand_pool_init
-10. Fast _pool init : start-fragment pool uses pre-cached CDF directly
-11. Conditional prior: true corpus transition probabilities P(a|s) used
-                      instead of marginal log-frequency prior when available;
-                      falls back to marginal prior for unseen parent fragments
-12. Soft scoring     : sa_score_component and qed_component now return
-                      soft gradients instead of binary gates
-13. Batched scoring  : score_batch_size > 1 accumulates rollouts and
-                      scores them in parallel via ThreadPoolExecutor;
-                      RDKit releases GIL so threading gives real speedup
-14. Zero-Arrow expand: _pool() pre-materialises all candidate rows as
-                      plain Python dicts at node creation time; pop_untried
-                      returns from a list lookup with zero .as_py() calls
-15. Minimal MolState : 4 scalars + immutable uid tuple; clone() is O(1);
-                      SMILES assembled once at leaf via _rows_by_uid
+1.  Pool draining          : zero-weight numpy array instead of Arrow slice+concat
+2.  Index selection        : searchsorted on pre-built CDF instead of np.random.choice(p=)
+3.  Weight building        : pre-cached log-frequency numpy arrays per tag group
+4.  Row reads              : pre-materialised Python lists per tag group
+5.  Incremental prior      : (FIX A) PUCT prior updated by appending one value and
+                             renormalising — no full vector rebuild per expansion
+6.  Cached group CDFs      : (FIX B) sample_compatible stage-1 uses pre-built per-end_tag
+                             CDF arrays — no list comprehension or sum() in rollout
+7.  Fast clone             : explicit scalar copy instead of deepcopy in MolState.clone()
+8.  Lazy CDF rebuild       : pop_untried skips CDF recompute on the first draw
+9.  Expand sub-timers      : expand_pop / expand_clone / expand_node / expand_pool_init
+10. Fast _pool init        : start-fragment pool uses pre-cached CDF directly
+11. Conditional prior      : true corpus transition probabilities P(a|s) used
+                             instead of marginal log-frequency prior when available;
+                             falls back to marginal prior for unseen parent fragments
+12. Soft scoring           : sa_score_component and qed_component return
+                             soft gradients instead of binary gates
+13. Batched scoring        : score_batch_size > 1 accumulates rollouts and
+                             scores them in parallel via ThreadPoolExecutor;
+                             RDKit releases GIL so threading gives real speedup
+14. Zero-Arrow expand      : _pool() pre-materialises all candidate rows as
+                             plain Python dicts at node creation time; pop_untried
+                             returns from _pool_rows[idx] with zero .as_py() calls
+15. Minimal MolState       : 4 scalars + immutable uid tuple; clone() is O(1);
+                             SMILES assembled once at leaf via _rows_by_uid
+16. O(1) is_fully_expanded : (v12 FIX) _untried_remaining scalar replaces
+                             _untried_w.sum() — eliminates O(N) numpy scan
+                             called 600k times per run (~616s gap in v11 profile)
+17. Zero-Arrow pop_untried : (v12 FIX) return self._pool_rows[idx] directly;
+                             eliminates Arrow column[idx].as_py() call entirely
+18. Profiled is_fully_exp  : (v12) is_fully_expanded now timed so regressions
+                             are visible in future profiles
 
 Usage
 -----
@@ -82,13 +89,14 @@ class MCTSProfiler:
 
     Tracked operations
     ------------------
-    select        : tree traversal (PUCT evaluation)
-    expand        : node expansion — pop_untried + child creation + prior update
-    simulate      : rollout — fragment sampling + tag filtering
-    score         : mol construction + reward function
-    backprop      : value propagation to root
-    library_query : Arrow filter calls inside simulate (subset of simulate)
-    prior_compute : PUCT prior vector update (subset of expand)
+    select              : tree traversal (PUCT evaluation)
+    expand              : node expansion — pop_untried + child creation + prior update
+    simulate            : rollout — fragment sampling + tag filtering
+    score               : mol construction + reward function
+    backprop            : value propagation to root
+    library_query       : Arrow filter calls inside simulate (subset of simulate)
+    prior_compute       : PUCT prior vector update (subset of expand)
+    is_fully_expanded   : O(1) scalar check — was O(N) sum() in v11
     """
 
     OPERATIONS = (
@@ -104,6 +112,7 @@ class MCTSProfiler:
         "expand_node",
         "expand_pool_init",
         "score_batch",
+        "is_fully_expanded",  # v12: newly tracked — was the ~616s hidden gap in v11
     )
 
     def __init__(self):
@@ -134,12 +143,12 @@ class MCTSProfiler:
             n = self.counts.get(op, 0)
             rows.append((op, t, n, t / n * 1000 if n else 0.0, t / grand_total * 100))
         rows.sort(key=lambda r: r[1], reverse=True)
-        hdr = f"{'Operation':<17} {'Total(s)':>8}  {'Calls':>7}  {'Mean(ms)':>10}  {'Share%':>8}"
+        hdr = f"{'Operation':<20} {'Total(s)':>8}  {'Calls':>7}  {'Mean(ms)':>10}  {'Share%':>8}"
         sep = "-" * len(hdr)
         lines = [sep, hdr, sep]
         for op, t, n, mean_ms, share in rows:
-            lines.append(f"{op:<17} {t:>8.3f}  {n:>7d}  {mean_ms:>10.3f}  {share:>7.1f}%")
-        lines += [sep, f"{'TOTAL':<17} {grand_total:>8.3f}", sep]
+            lines.append(f"{op:<20} {t:>8.3f}  {n:>7d}  {mean_ms:>10.3f}  {share:>7.1f}%")
+        lines += [sep, f"{'TOTAL':<20} {grand_total:>8.3f}", sep]
         return "\n".join(lines)
 
     def print_report(self) -> None:
@@ -210,11 +219,15 @@ def composite_score(
     """
     if mol is None:
         return 0.0
-    return (
-        lipinski_weight * lipinski_score(mol)
-        + sa_weight * sa_score_component(mol, threshold=sa_threshold)
-        + qed_weight * qed_component(mol, threshold=qed_threshold)
-    )
+
+    score = 0.0
+    if lipinski_weight:
+        score += lipinski_weight * lipinski_score(mol)
+    if sa_weight:
+        score += sa_weight * sa_score_component(mol, threshold=sa_threshold)
+    if qed_weight:
+        score += qed_weight * qed_component(mol, threshold=qed_threshold)
+    return score
 
 
 class _CompositeScorer:
@@ -689,12 +702,13 @@ class MCTSNode:
         "depth",
         "_prior",
         "_prior_logf",
-        "_pool_table",  # pa.Table — kept for num_rows / compatibility checks only
-        "_pool_rows",  # list[dict] — pre-materialised rows, zero Arrow in hot path
-        "_pool_size",  # int — cached pool size
-        "_untried_w",
-        "_untried_cdf",
-        "_untried_dirty",
+        "_pool_table",  # pa.Table — kept for compatibility checks only
+        "_pool_rows",  # list[dict] — pre-materialised, zero Arrow in hot path
+        "_pool_size",  # int — total pool size (constant after _pool())
+        "_untried_remaining",  # int — v12: O(1) exhaustion check replaces sum()
+        "_untried_w",  # np.ndarray — zero-weight tracking for weighted sampling
+        "_untried_cdf",  # np.ndarray — lazy CDF over untried weights
+        "_untried_dirty",  # bool — CDF needs rebuild
     )
 
     def __init__(
@@ -714,8 +728,9 @@ class MCTSNode:
         self._prior: Optional[np.ndarray] = None
         self._prior_logf: Optional[np.ndarray] = None
         self._pool_table: Optional[pa.Table] = None
-        self._pool_rows: Optional[list] = None  # pre-materialised, no Arrow
+        self._pool_rows: Optional[list] = None
         self._pool_size: int = 0
+        self._untried_remaining: int = 0  # v12: tracks how many non-zero slots remain
         self._untried_w: Optional[np.ndarray] = None
         self._untried_cdf: Optional[np.ndarray] = None
         self._untried_dirty: bool = False
@@ -819,6 +834,8 @@ class MCTSNode:
         self._pool_table = pool
         self._pool_rows = pre_rows
         self._pool_size = len(pre_rows)
+        # v12: initialise scalar counter — decremented by pop_untried, O(1) check
+        self._untried_remaining = self._pool_size
 
         if pre_rows:
             if cdf_cache is not None:
@@ -839,12 +856,15 @@ class MCTSNode:
         lib: FragmentLibrary,
         profiler: Optional["MCTSProfiler"] = None,
     ) -> bool:
+        # v12: O(1) check — replaces _untried_w.sum() == 0.0 which was O(N)
+        # and consumed ~616s in the v11 profile (untracked gap inside expand)
+        if profiler:
+            profiler.start("is_fully_expanded")
         self._pool(lib, profiler)  # ensure pool is initialised
-        if self._pool_size == 0:
-            return True
-        if self._untried_w is None:
-            return True
-        return self._untried_w.sum() == 0.0
+        result = self._pool_size == 0 or self._untried_remaining == 0
+        if profiler:
+            profiler.stop("is_fully_expanded")
+        return result
 
     def pop_untried(
         self,
@@ -855,17 +875,20 @@ class MCTSNode:
         """
         Sample one fragment from the untried pool.
 
-        One Arrow .as_py() call to read the unique_id, then O(1) lookup
-        in lib._rows_by_uid (pre-materialised Python dict) for the full row.
+        v12: returns self._pool_rows[idx] directly — zero Arrow .as_py() calls.
+        _untried_remaining is decremented to keep is_fully_expanded O(1).
         """
         self._pool(lib, profiler)
         if self._pool_size == 0 or self._untried_w is None:
             return None
-        total = self._untried_w.sum()
-        if total == 0.0:
+        if self._untried_remaining == 0:
             return None
         if self._untried_dirty:
-            w_norm = self._untried_w / total
+            # _untried_remaining > 0 guarantees at least one non-zero weight,
+            # so sum() > 0 is certain — no zero-sum guard needed here.
+            # We still call sum() once for normalisation, but only when the
+            # CDF actually needs rebuilding (once per pop, not in is_fully_expanded).
+            w_norm = self._untried_w / self._untried_w.sum()
             self._untried_cdf = np.cumsum(w_norm)
             self._untried_dirty = False
         idx = min(
@@ -874,9 +897,10 @@ class MCTSNode:
         )
         self._untried_w[idx] = 0.0
         self._untried_dirty = True
-        # One Arrow scalar read for uid, then O(1) pre-materialised dict lookup
-        uid = self._pool_table.column("unique_id")[idx].as_py()  # pyright: ignore[reportOptionalMemberAccess]
-        return lib._rows_by_uid.get(uid)
+        # v12: decrement scalar counter — O(1) exhaustion tracking
+        self._untried_remaining -= 1
+        # v12: direct list lookup — zero Arrow reads (was: column[idx].as_py() + _rows_by_uid)
+        return self._pool_rows[idx]  # type: ignore[index]
 
     def add_dirichlet_noise(self, alpha: float = 0.3, epsilon: float = 0.25) -> None:
         if self._prior is None or len(self.children) == 0:
@@ -935,6 +959,11 @@ def _expand(
 ) -> MCTSNode:
     if profiler:
         profiler.start("expand")
+    # is_fully_expanded is now timed inside its own method
+    if node.is_fully_expanded(lib, profiler):
+        if profiler:
+            profiler.stop("expand")
+        return node
     if profiler:
         profiler.start("expand_pop")
     row = node.pop_untried(lib, temperature, profiler)
@@ -1439,8 +1468,9 @@ class MCTSDrugDesign:
                 rewards = _score_states_batch(
                     buffer_states,
                     self.score_fn,
-                    self.score_batch_size,  # pyright: ignore[reportArgumentType]
-                    self.profiler,  # pyright: ignore[reportArgumentType]
+                    self.library,
+                    self.score_batch_size,
+                    self.profiler,
                 )
                 for nd, ts, rw in zip(buffer_nodes, buffer_states, rewards):
                     _backpropagate(nd, rw, self.profiler)
