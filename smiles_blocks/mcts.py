@@ -9,23 +9,24 @@ block, can_smiles, first_connected_can_idx, last_connected_can_idx,
 unique_id, begin_tag, end_tag, MolWt, nHDonors, nHAcceptors,
 nRotatableBonds, CrippenlogP, TPSA, frequency, status
 
-Architecture (v13)
+Architecture (v14)
 ------------------
-Leaf parallelisation with virtual loss replaces the v10-v12 root-parallelisation
-(ProcessPoolExecutor over independent trees).  A single shared MCTS tree avoids
-inter-run correlation and the shared-memory serialisation overhead.
+Process parallelisation over independent runs (ProcessPoolExecutor) with
+virtual-loss PUCT quality improvement from v13.
 
-Inner loop (single process, single tree):
-  For each batch of B leaves:
-    1. Serial: select → expand → simulate  (×B, applying virtual loss each time)
-    2. Parallel: score B terminal states via ThreadPoolExecutor
-       RDKit releases the GIL for C++ mol construction + scoring, giving
-       near-linear speedup on the 1.2 ms/mol bottleneck.
-    3. Serial: backpropagate all B results (removes virtual loss, adds real reward)
+Threading was tested in v13 but Activity Monitor confirmed the GIL prevents
+real multi-core utilisation for this workload: Python overhead around RDKit
+calls (SMILES assembly, dict lookups, argument marshalling) keeps threads
+serialised, achieving only ~1.3 cores out of 12 on Apple M2.
 
-Virtual loss: each node on a selected path receives a temporary pessimistic
-reward (virtual_loss_value, default -1.0) so subsequent selects in the same
-batch avoid the in-flight path.  Backprop removes it: value += reward - vl.
+Processes bypass the GIL entirely. Each worker:
+  - Receives the fragment library via shared memory (zero-copy Arrow IPC)
+  - Runs a fully independent serial MCTS tree (no shared state)
+  - Returns collected molecules and profiler data to the main process
+
+Diversity across runs comes from independent random seeds and independent
+tree structures, not from virtual loss (which is kept for within-run PUCT
+quality but does not drive parallelism).
 
 Performance optimisations (cumulative)
 ---------------------------------------
@@ -40,26 +41,30 @@ Performance optimisations (cumulative)
 9.  Zero-Arrow expand      : pop_untried returns _pool_rows[idx] directly
 10. Minimal MolState       : 4 scalars + immutable tuple; SMILES at leaf only
 11. O(1) is_fully_expanded : _untried_remaining scalar instead of sum()
-12. Leaf parallelisation   : (v13) ThreadPoolExecutor scores B leaves in parallel;
-                             virtual loss steers selects to diverse paths
+12. Virtual-loss PUCT      : (v13) configurable penalty on in-flight nodes
+                             improves within-run exploration quality
+13. Process parallelism    : (v14) ProcessPoolExecutor over n_runs; each
+                             worker is a fully independent serial MCTS tree
+                             bypassing the GIL; shared-memory Arrow transport
 
 Usage
 -----
 >>> from mcts_drug_design import MCTSDrugDesign, make_composite_scorer
->>> scorer = make_composite_scorer()
->>> mcts = MCTSDrugDesign(fragment_table, compatibility_map,
-...                       n_iter=40_000, leaf_workers=8)
->>> results = mcts.run(n_runs=1, temperature=1.0, score_threshold=0.80)
+>>> scorer = make_composite_scorer(qed_weight=0.4, sa_weight=0.6, lipinski_weight=0.)
+>>> mcts = MCTSDrugDesign(fragment_table, compatibility_map, n_iter=40_000)
+>>> results = mcts.run(n_runs=100, n_jobs=-1, score_threshold=0.50)
 >>> mcts.profiler.print_report()
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import logging
 import math
 from multiprocessing.shared_memory import SharedMemory
+import os
+import signal
 import time
 from typing import Optional
 
@@ -1131,146 +1136,86 @@ def _score_state(
     return reward
 
 
-def _score_states_batch(
-    states: list,
-    score_fn,
-    lib: "FragmentLibrary",
-    n_threads: int,
-    profiler: Optional[MCTSProfiler] = None,
-) -> list:
-    """
-    Score a batch of MolState objects in parallel via ThreadPoolExecutor.
-    RDKit releases the GIL during C++ calls so threading gives real speedup.
-    """
-    if profiler:
-        profiler.start("score_batch")
-
-    def _score_one(state):
-        mol = state.to_mol(lib)
-        return score_fn(mol) if mol else 0.0
-
-    with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        rewards = list(pool.map(_score_one, states))
-
-    if profiler:
-        profiler.stop("score_batch")
-    return rewards
-
-
 # ============================================================
-# 7.  LEAF-PARALLEL SEARCH ENGINE
+# 7.  TOP-LEVEL WORKER  (module-level for pickling)
 # ============================================================
 
 
-def _search_leaf_parallel(
-    root: MCTSNode,
-    lib: FragmentLibrary,
-    score_fn,
-    n_iter: int,
-    ucb_c: float,
-    rollout_depth: int,
-    temperature: float,
-    dirichlet_alpha: float,
-    dirichlet_eps: float,
-    use_dirichlet: bool,
-    score_threshold: float,
-    leaf_workers: int,
-    virtual_loss_value: float,
-    thread_pool: ThreadPoolExecutor,
-    profiler: Optional[MCTSProfiler] = None,
-) -> list[dict]:
+def _search_one(args: tuple) -> tuple[list[dict], dict]:
     """
-    Single-tree MCTS with leaf parallelisation.
+    Picklable worker for one serial MCTS search in a child process.
 
-    Each iteration batch:
-      1. Serial select+expand+simulate  ×leaf_workers  (virtual loss applied)
-      2. Parallel score via thread_pool  (RDKit releases GIL)
-      3. Serial backprop                ×leaf_workers  (virtual loss removed)
-
-    The thread_pool is caller-owned and persistent across calls to avoid
-    repeated thread-spawn overhead.
-
-    Parameters
-    ----------
-    virtual_loss_value : float
-        Reward applied to in-flight nodes during select to steer away from
-        active paths.  Negative values (e.g. -1.0) act as pessimistic priors.
-        0.0 disables virtual loss (B paths may overlap).
+    Receives the fragment library via shared memory (zero-copy Arrow IPC).
+    Runs a fully independent tree — no shared state with other workers.
+    Virtual loss is applied within the tree for PUCT quality but does not
+    coordinate across processes (each process has its own root).
     """
+    (
+        shm_name,
+        shm_bytes,
+        compat_map,
+        target_n_blocks,
+        n_iter,
+        ucb_c,
+        score_fn,
+        rollout_depth,
+        temperature,
+        dirichlet_alpha,
+        dirichlet_eps,
+        use_dirichlet,
+        score_threshold,
+        conditional_records,
+        virtual_loss_value,
+    ) = args
+
+    library = FragmentLibrary.from_shared_memory(
+        shm_name,
+        shm_bytes,
+        compat_map,
+        temperature=temperature,
+        conditional_records=conditional_records,
+    )
+    root = MCTSNode(state=MolState(target_n_blocks=target_n_blocks))
+    profiler = MCTSProfiler()
+
     collected: list[dict] = []
     seen_smiles: set[str] = set()
 
-    # Pre-bind score function for thread workers — avoids closure overhead
-    _lib = lib
-    _score_fn = score_fn
-
-    def _score_one(state: MolState) -> float:
-        mol = state.to_mol(_lib)
-        return _score_fn(mol) if mol else 0.0
-
-    iterations_done = 0
-    while iterations_done < n_iter:
-        batch_size = min(leaf_workers, n_iter - iterations_done)
-
-        # ── Phase 1: serial select → expand → simulate ──────────────────
-        if profiler:
-            profiler.start("batch_serial")
-        leaves: list[tuple[list[MCTSNode], MolState]] = []
-        for _ in range(batch_size):
-            node, path = _select(root, lib, ucb_c, virtual_loss_value, profiler)
-            if not node.is_terminal():
-                node = _expand(
-                    node,
-                    lib,
-                    temperature,
-                    dirichlet_alpha,
-                    dirichlet_eps,
-                    use_dirichlet,
-                    profiler,
-                )
-                # Update path tail: _expand may return a new child node
-                if node is not path[-1]:
-                    node.virtual_loss += 1
-                    path.append(node)
-            terminal_state = _simulate(
-                node.state.clone(), lib, rollout_depth, temperature, profiler
+    for _ in range(n_iter):
+        node, path = _select(root, library, ucb_c, virtual_loss_value, profiler)
+        if not node.is_terminal():
+            node = _expand(
+                node,
+                library,
+                temperature,
+                dirichlet_alpha,
+                dirichlet_eps,
+                use_dirichlet,
+                profiler,
             )
-            leaves.append((path, terminal_state))
-        if profiler:
-            profiler.stop("batch_serial")
+            # If _expand returned a new child, extend the path and apply VL
+            if node is not path[-1]:
+                node.virtual_loss += 1
+                path.append(node)
+        terminal_state = _simulate(
+            node.state.clone(), library, rollout_depth, temperature, profiler
+        )
+        reward = _score_state(terminal_state, score_fn, library, profiler)
+        _backpropagate(path, reward, virtual_loss_value, profiler)
+        if terminal_state.is_complete and reward >= score_threshold:
+            smi = terminal_state.assembled_smiles(library)
+            if smi not in seen_smiles:
+                seen_smiles.add(smi)
+                collected.append(
+                    {
+                        "smiles": smi,
+                        "score": reward,
+                        "n_blocks": terminal_state.n_blocks,
+                        "fragment_ids": list(terminal_state._uid_chain),
+                    }
+                )
 
-        # ── Phase 2: parallel scoring ────────────────────────────────────
-        if profiler:
-            profiler.start("score_batch")
-        terminal_states = [ts for _, ts in leaves]
-        futures = [thread_pool.submit(_score_one, ts) for ts in terminal_states]
-        rewards = [f.result() for f in futures]
-        if profiler:
-            profiler.stop("score_batch")
-
-        # ── Phase 3: serial backprop + collection ────────────────────────
-        if profiler:
-            profiler.start("backprop_batch")
-        for (path, terminal_state), reward in zip(leaves, rewards):
-            _backpropagate(path, reward, virtual_loss_value, profiler)
-            if terminal_state.is_complete and reward >= score_threshold:
-                smi = terminal_state.assembled_smiles(lib)
-                if smi not in seen_smiles:
-                    seen_smiles.add(smi)
-                    collected.append(
-                        {
-                            "smiles": smi,
-                            "score": reward,
-                            "n_blocks": terminal_state.n_blocks,
-                            "fragment_ids": list(terminal_state._uid_chain),
-                        }
-                    )
-        if profiler:
-            profiler.stop("backprop_batch")
-
-        iterations_done += batch_size
-
-    return collected
+    return collected, profiler.to_dict()
 
 
 # ============================================================
@@ -1280,34 +1225,34 @@ def _search_leaf_parallel(
 
 class MCTSDrugDesign:
     """
-    MCTS-based de novo drug designer — leaf parallelisation (v13).
+    MCTS-based de novo drug designer — process parallelism (v14).
 
-    A single shared MCTS tree is searched for the full n_iter budget.
-    Leaf parallelisation scores B terminal states concurrently via
-    ThreadPoolExecutor (RDKit releases the GIL, giving near-linear speedup).
-    Virtual loss steers each batch's B selects to distinct tree paths.
+    n_runs independent trees are searched in parallel via ProcessPoolExecutor.
+    Each worker process receives the fragment library via shared memory and
+    runs a fully serial MCTS loop, bypassing the GIL entirely.
+
+    Virtual loss (from v13) is preserved for within-run PUCT quality:
+    it makes the Q-value of recently-visited nodes temporarily pessimistic,
+    improving exploration even in a single-tree serial run.
 
     Parameters
     ----------
-    fragment_table    : pa.Table   Fragment library (must include 'frequency').
-    compatibility_map : dict|None  R-BRICS {end_tag: {begin_tags}}.
-    block_count_mu    : float      Gaussian mean for chain length.
-    block_count_sigma : float      Gaussian std-dev for chain length.
-    min_blocks        : int        Hard min chain length (default 2).
-    max_blocks        : int        Hard max chain length (default 10).
-    n_iter            : int        MCTS iterations per run (default 40_000).
-    ucb_c             : float      PUCT exploration constant (default sqrt(2)).
-    score_fn          : callable   mol -> [0,1]. Default: lipinski_score.
-    rollout_depth     : int        Max rollout steps (default 20).
-    conditional_table : pd.DataFrame | pa.Table | None
+    fragment_table     : pa.Table   Fragment library (must include 'frequency').
+    compatibility_map  : dict|None  R-BRICS {end_tag: {begin_tags}}.
+    block_count_mu     : float      Gaussian mean for chain length.
+    block_count_sigma  : float      Gaussian std-dev for chain length.
+    min_blocks         : int        Hard min chain length (default 2).
+    max_blocks         : int        Hard max chain length (default 10).
+    n_iter             : int        MCTS iterations per run (default 40_000).
+    ucb_c              : float      PUCT exploration constant (default sqrt(2)).
+    score_fn           : callable   mol -> [0,1]. Default: lipinski_score.
+    rollout_depth      : int        Max rollout steps (default 20).
+    conditional_table  : pd.DataFrame | pa.Table | None
         Fragment transition counts. Columns: unique_id, next_unique_id,
         frequency, proba.
-    leaf_workers      : int
-        Number of leaves scored in parallel per batch (default 8).
-        Tune to CPU count; 4–8 is a good starting range.
-    virtual_loss_value: float
+    virtual_loss_value : float
         Pessimistic reward applied to in-flight nodes during select (default -1.0).
-        0.0 disables virtual loss.  More negative → stronger diversity pressure.
+        Improves within-run PUCT exploration quality. 0.0 disables it.
     """
 
     def __init__(
@@ -1323,9 +1268,15 @@ class MCTSDrugDesign:
         score_fn=None,
         rollout_depth: int = 20,
         conditional_table=None,
-        leaf_workers: int = 8,
         virtual_loss_value: float = -1.0,
     ):
+        self._conditional_records: Optional[list] = (
+            conditional_table.to_pandas().to_dict("records")  # pyright: ignore[reportOptionalMemberAccess]
+            if isinstance(conditional_table, pa.Table)
+            else conditional_table.to_dict("records")
+            if conditional_table is not None
+            else None
+        )
         self.library = FragmentLibrary(
             fragment_table,
             compatibility_map,
@@ -1336,7 +1287,6 @@ class MCTSDrugDesign:
         self.ucb_c = ucb_c
         self.score_fn = score_fn or lipinski_score
         self.rollout_depth = rollout_depth
-        self.leaf_workers = max(1, leaf_workers)
         self.virtual_loss_value = virtual_loss_value
         self.profiler = MCTSProfiler()
 
@@ -1346,7 +1296,9 @@ class MCTSDrugDesign:
 
     def run(
         self,
-        n_runs: int = 1,
+        target_compounds: int = 300_000,
+        max_runs: int = 200,
+        n_jobs: int = -1,
         temperature: float = 1.0,
         dirichlet_alpha: float = 0.3,
         dirichlet_eps: float = 0.25,
@@ -1355,62 +1307,171 @@ class MCTSDrugDesign:
         print_profile: bool = True,
     ) -> list[dict]:
         """
-        Run *n_runs* independent single-tree MCTS searches with leaf
-        parallelisation and collect all molecules scoring >= score_threshold.
+        Run independent MCTS searches until either target_compounds unique
+        molecules above score_threshold are collected, or max_runs searches
+        have been completed — whichever comes first.
 
-        Each run uses a fresh root node and the full n_iter budget.
-        n_runs > 1 provides structural diversity via independent tree resets
-        rather than correlated parallel workers on the same tree.
+        Runs are submitted in waves of n_workers at a time so the compound
+        counter is checked between waves without cancelling in-flight work.
+        Each wave costs at most n_workers × n_iter iterations.
 
-        The ThreadPoolExecutor is created once per run() call and shared
-        across all batches to avoid repeated thread-spawn overhead.
+        Parameters
+        ----------
+        target_compounds : int
+            Stop early once this many unique molecules above score_threshold
+            have been collected across all completed runs. Default 300_000.
+        max_runs : int
+            Hard ceiling on total runs regardless of compound count. Default 200.
+        n_jobs : int
+            Worker processes. -1 = os.cpu_count(). Wave size = n_jobs.
+        score_threshold : float
+            Minimum composite score for a molecule to be collected.
         """
         self.profiler = MCTSProfiler()
-        results: list[dict] = []
+        n_workers = os.cpu_count() if n_jobs == -1 else max(1, n_jobs)
 
-        with ThreadPoolExecutor(max_workers=self.leaf_workers) as thread_pool:
-            for run_idx in range(n_runs):
-                target_n_blocks = self.sampler.sample()
-                root = MCTSNode(state=MolState(target_n_blocks=target_n_blocks))
-                batch = _search_leaf_parallel(
-                    root=root,
-                    lib=self.library,
-                    score_fn=self.score_fn,
-                    n_iter=self.n_iter,
-                    ucb_c=self.ucb_c,
-                    rollout_depth=self.rollout_depth,
-                    temperature=temperature,
-                    dirichlet_alpha=dirichlet_alpha,
-                    dirichlet_eps=dirichlet_eps,
-                    use_dirichlet=use_dirichlet,
-                    score_threshold=score_threshold,
-                    leaf_workers=self.leaf_workers,
-                    virtual_loss_value=self.virtual_loss_value,
-                    thread_pool=thread_pool,
-                    profiler=self.profiler,
-                )
-                results.extend(batch)
-                logger.info(
-                    "Run %d/%d: %d molecules above %.2f",
-                    run_idx + 1,
-                    n_runs,
-                    len(batch),
-                    score_threshold,
-                )
-
+        # Accumulate results and dedup incrementally so the target check
+        # is always against unique SMILES, not raw counts.
         seen: set[str] = set()
         unique: list[dict] = []
-        for r in results:
-            if r["smiles"] not in seen:
-                seen.add(r["smiles"])
-                unique.append(r)
+        runs_done = 0
+
+        def _make_args(shm_name, shm_bytes, target_n_blocks):
+            return (
+                shm_name,
+                shm_bytes,
+                self.library.compatibility_map,
+                target_n_blocks,
+                self.n_iter,
+                self.ucb_c,
+                self.score_fn,
+                self.rollout_depth,
+                temperature,
+                dirichlet_alpha,
+                dirichlet_eps,
+                use_dirichlet,
+                score_threshold,
+                self._conditional_records,
+                self.virtual_loss_value,
+            )
+
+        def _ingest(batch: list[dict]) -> None:
+            """Dedup and accumulate results from one completed run."""
+            for r in batch:
+                if r["smiles"] not in seen:
+                    seen.add(r["smiles"])
+                    unique.append(r)
+
+        if n_workers == 1:
+            # Serial path — useful for debugging.
+            while runs_done < max_runs and len(unique) < target_compounds:
+                target_n_blocks = self.sampler.sample()
+                root = MCTSNode(state=MolState(target_n_blocks=target_n_blocks))
+                seen_smiles: set[str] = set()
+                for _ in range(self.n_iter):
+                    node, path = _select(
+                        root,
+                        self.library,
+                        self.ucb_c,
+                        self.virtual_loss_value,
+                        self.profiler,
+                    )
+                    if not node.is_terminal():
+                        node = _expand(
+                            node,
+                            self.library,
+                            temperature,
+                            dirichlet_alpha,
+                            dirichlet_eps,
+                            use_dirichlet,
+                            self.profiler,
+                        )
+                        if node is not path[-1]:
+                            node.virtual_loss += 1
+                            path.append(node)
+                    terminal_state = _simulate(
+                        node.state.clone(),
+                        self.library,
+                        self.rollout_depth,
+                        temperature,
+                        self.profiler,
+                    )
+                    reward = _score_state(
+                        terminal_state, self.score_fn, self.library, self.profiler
+                    )
+                    _backpropagate(path, reward, self.virtual_loss_value, self.profiler)
+                    if terminal_state.is_complete and reward >= score_threshold:
+                        smi = terminal_state.assembled_smiles(self.library)
+                        if smi not in seen_smiles:
+                            seen_smiles.add(smi)
+                            _ingest(
+                                [
+                                    {
+                                        "smiles": smi,
+                                        "score": reward,
+                                        "n_blocks": terminal_state.n_blocks,
+                                        "fragment_ids": list(terminal_state._uid_chain),
+                                    }
+                                ]
+                            )
+                runs_done += 1
+                logger.info(
+                    "Run %d done — %d unique molecules so far (target %d, max_runs %d)",
+                    runs_done,
+                    len(unique),
+                    target_compounds,
+                    max_runs,
+                )
+
+        else:
+            shm, shm_bytes = FragmentLibrary.to_shared_memory(self.library.table)
+            _shm = shm
+
+            def _sig(s, f):
+                _shm.close()
+                _shm.unlink()
+                raise SystemExit(1)
+
+            signal.signal(signal.SIGTERM, _sig)
+
+            try:
+                with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                    while runs_done < max_runs and len(unique) < target_compounds:
+                        # Wave size: fill all workers, but don't exceed max_runs
+                        wave = min(n_workers, max_runs - runs_done)  # pyright: ignore[reportArgumentType]
+                        wave_args = [
+                            _make_args(shm.name, shm_bytes, self.sampler.sample())
+                            for _ in range(wave)
+                        ]
+                        futures = [pool.submit(_search_one, a) for a in wave_args]
+                        for fut in as_completed(futures):
+                            batch, prof_dict = fut.result()
+                            _ingest(batch)
+                            self.profiler.merge_dict(prof_dict)
+                        runs_done += wave
+                        logger.info(
+                            "Wave done — %d runs completed, "
+                            "%d unique molecules (target %d, budget %d)",
+                            runs_done,
+                            len(unique),
+                            target_compounds,
+                            max_runs,
+                        )
+            finally:
+                shm.close()
+                shm.unlink()
+
         unique.sort(key=lambda r: r["score"], reverse=True)
 
+        stop_reason = (
+            "target reached" if len(unique) >= target_compounds else "run budget exhausted"
+        )
         logger.info(
-            "%d unique molecules above threshold %.2f from %d runs.",
+            "Finished: %d unique molecules above %.2f from %d runs (%s).",
             len(unique),
             score_threshold,
-            n_runs,
+            runs_done,
+            stop_reason,
         )
         if print_profile:
             self.profiler.print_report()
