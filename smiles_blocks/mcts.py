@@ -589,6 +589,124 @@ class FragmentLibrary:
         w = np.exp(log_f)
         return w / w.sum()
 
+    def apply_novelty_penalty(
+        self,
+        fragment_counts: dict[str, int],
+        novelty_beta: float,
+    ) -> None:
+        """
+        Downweight fragments that have already been heavily explored across
+        previous waves by subtracting a penalty from their log-weights.
+
+        The adjusted log-weight for fragment a becomes:
+            log(f_a + 1) / T  -  novelty_beta * log(seen_a + 1)
+
+        where seen_a is the number of times fragment a appeared in molecules
+        collected so far. This reshapes the CDF for every tag group so that
+        the next wave's workers sample from a different region of fragment space.
+
+        Called once per wave in the main process before submitting new workers.
+        Only rebuilds CDFs for tag groups that contain penalised fragments.
+
+        Parameters
+        ----------
+        fragment_counts : dict[str, int]
+            Maps unique_id -> total occurrence count across all collected molecules.
+        novelty_beta : float
+            Penalty strength. 0.0 = no effect. 1.0 = halves the effective
+            log-weight of a fragment seen 10 times (log(11) ≈ 2.4 nats).
+            Typical range: 0.1 – 1.0.
+        """
+        if not fragment_counts or novelty_beta == 0.0:
+            return
+
+        for tag in self._by_begin:
+            rows = self._rows[tag]
+            uids = rows["unique_id"]
+            freqs = rows["frequency"]
+            n = len(uids)
+
+            # Check if any fragment in this group has been seen
+            if not any(uid in fragment_counts for uid in uids):
+                continue
+
+            # Rebuild log-weights with penalty
+            log_f = np.array(
+                [
+                    math.log1p(freqs[i]) / self._temperature
+                    - novelty_beta * math.log1p(fragment_counts.get(uids[i], 0))
+                    for i in range(n)
+                ],
+                dtype=np.float64,
+            )
+            log_f -= log_f.max()
+            self._logw[tag] = log_f.astype(np.float32)
+            w = np.exp(log_f)
+            w /= w.sum()
+            self._cdf[tag] = np.cumsum(w).astype(np.float64)
+
+            # Rebuild terminal-only CDF for this tag
+            tidx = self._terminal_idx.get(tag, [])
+            if tidx:
+                sub = self._logw[tag][tidx]
+                sub = sub - sub.max()
+                wt = np.exp(sub)
+                wt /= wt.sum()
+                self._cdf_terminal_only[tag] = np.cumsum(wt)
+
+        # Rebuild per-end_tag compatibility CDFs (stage-1 of sample_compatible)
+        # These weight tag groups by their total pool size — recompute from
+        # updated per-tag CDFs to stay consistent.
+        for end_tag, avail in list(self._compat_tags.items()):
+            if end_tag.endswith("__nt") or end_tag.endswith("__t"):
+                continue  # handled via the base end_tag rebuild below
+            # Recompute group-level weights as sum of exp(logw) per tag
+            sizes_all = np.array(
+                [np.exp(self._logw[t]).sum() if t in self._logw else 0.0 for t in avail],
+                dtype=np.float64,
+            )
+            if sizes_all.sum() > 0:
+                sizes_all /= sizes_all.sum()
+                self._compat_cdf[end_tag] = np.cumsum(sizes_all)
+
+            avail_nt = self._compat_tags.get(end_tag + "__nt", [])
+            if avail_nt:
+                sizes_nt = np.array(
+                    [
+                        np.exp(
+                            self._logw[t][
+                                [
+                                    i
+                                    for i, et in enumerate(self._rows[t]["end_tag"])
+                                    if et != "no_tag"
+                                ]
+                            ]
+                        ).sum()
+                        if t in self._logw
+                        else 0.0
+                        for t in avail_nt
+                    ],
+                    dtype=np.float64,
+                )
+                if sizes_nt.sum() > 0:
+                    sizes_nt /= sizes_nt.sum()
+                    self._compat_cdf_no_terminal[end_tag] = np.cumsum(sizes_nt)
+
+            avail_t = self._compat_tags.get(end_tag + "__t", [])
+            if avail_t:
+                sizes_t = np.array(
+                    [
+                        np.exp(self._logw[t][self._terminal_idx[t]]).sum()
+                        if t in self._logw and self._terminal_idx.get(t)
+                        else 0.0
+                        for t in avail_t
+                    ],
+                    dtype=np.float64,
+                )
+                if sizes_t.sum() > 0:
+                    sizes_t /= sizes_t.sum()
+                    self._compat_cdf_terminal[end_tag] = np.cumsum(sizes_t)
+
     # ------------------------------------------------------------------
     # Shared-memory transport
     # ------------------------------------------------------------------
@@ -611,19 +729,24 @@ class FragmentLibrary:
         compatibility_map: Optional[dict] = None,
         temperature: float = 1.0,
         conditional_records: Optional[list] = None,
+        fragment_counts: Optional[dict] = None,
+        novelty_beta: float = 0.0,
     ) -> "FragmentLibrary":
         shm = SharedMemory(name=shm_name, create=False)
         buf = pa.py_buffer(bytes(shm.buf[:n_bytes]))  # pyright: ignore[reportOptionalSubscript]
         reader = ipc.open_file(buf)
         table = reader.read_all()
         cond_df = pd.DataFrame(conditional_records) if conditional_records else None
-        return FragmentLibrary(
+        lib = FragmentLibrary(
             table,
             compatibility_map,
             _shm_handle=shm,
             temperature=temperature,
             conditional_table=cond_df,
         )
+        if fragment_counts and novelty_beta > 0.0:
+            lib.apply_novelty_penalty(fragment_counts, novelty_beta)
+        return lib
 
 
 # ============================================================
@@ -707,11 +830,10 @@ class MCTSNode:
         "_pool_table",  # pa.Table — kept for compatibility checks only
         "_pool_rows",  # list[dict] — pre-materialised, zero Arrow in hot path
         "_pool_size",  # int — total pool size (constant after _pool())
-        "_untried_remaining",  # int — v12: O(1) exhaustion check replaces sum()
+        "_untried_remaining",  # int — O(1) exhaustion check
         "_untried_w",  # np.ndarray — zero-weight tracking for weighted sampling
         "_untried_cdf",  # np.ndarray — lazy CDF over untried weights
         "_untried_dirty",  # bool — CDF needs rebuild
-        "virtual_loss",  # int — count of in-flight leaf selections through this node
     )
 
     def __init__(
@@ -737,26 +859,19 @@ class MCTSNode:
         self._untried_w: Optional[np.ndarray] = None
         self._untried_cdf: Optional[np.ndarray] = None
         self._untried_dirty: bool = False
-        self.virtual_loss: int = 0  # incremented by select, cleared by backprop
 
-    def puct(self, c: float, child_idx: int, virtual_loss_value: float = -1.0) -> float:
+    def puct(self, c: float, child_idx: int) -> float:
         child = self.children[child_idx]
-        total_visits = child.visits + child.virtual_loss
-        # Virtual loss: pessimistic Q during in-flight evaluation steers
-        # subsequent selects in the same batch away from this path.
-        effective_value = child.value + child.virtual_loss * virtual_loss_value
-        q = effective_value / total_visits if total_visits > 0 else 0.0
+        q = child.value / child.visits if child.visits > 0 else 0.0
         prior = (
             float(self._prior[child_idx])
             if self._prior is not None and child_idx < len(self._prior)
             else 1.0 / max(len(self.children), 1)
         )
-        return q + c * prior * math.sqrt(max(self.visits, 1)) / (1 + total_visits)
+        return q + c * prior * math.sqrt(max(self.visits, 1)) / (1 + child.visits)
 
-    def best_child(self, c: float, virtual_loss_value: float = -1.0) -> "MCTSNode":
-        return self.children[
-            max(range(len(self.children)), key=lambda i: self.puct(c, i, virtual_loss_value))
-        ]
+    def best_child(self, c: float) -> "MCTSNode":
+        return self.children[max(range(len(self.children)), key=lambda i: self.puct(c, i))]
 
     def is_terminal(self) -> bool:
         return self.state.is_complete
@@ -943,54 +1058,33 @@ def _select(
     node: MCTSNode,
     lib: FragmentLibrary,
     c: float,
-    virtual_loss_value: float = -1.0,
     profiler: Optional[MCTSProfiler] = None,
-) -> tuple[MCTSNode, list[MCTSNode]]:
-    """
-    Walk the tree to a leaf, applying virtual loss to every node on the path.
-
-    Returns (leaf_node, path) where path is root→leaf inclusive.
-    Virtual loss is applied here so subsequent selects in the same batch
-    steer away from this path before backprop removes it.
-    """
+) -> MCTSNode:
     if profiler:
         profiler.start("select")
-    path: list[MCTSNode] = [node]
-    node.virtual_loss += 1
     while not node.is_terminal():
         if not node.is_fully_expanded(lib, profiler):
             break
         if not node.children:
             break
-        node = node.best_child(c, virtual_loss_value)
-        node.virtual_loss += 1
-        path.append(node)
+        node = node.best_child(c)
     if profiler:
         profiler.stop("select")
-    return node, path
+    return node
 
 
 def _backpropagate(
-    path: list[MCTSNode],
+    node: MCTSNode,
     reward: float,
-    virtual_loss_value: float = -1.0,
     profiler: Optional[MCTSProfiler] = None,
 ) -> None:
-    """
-    Propagate reward up the path, removing virtual loss from each node.
-
-    value correction: we added virtual_loss_value once per virtual_loss count,
-    so we subtract it and add the real reward instead.
-    """
     if profiler:
         profiler.start("backprop")
-    for node in path:
-        node.visits += 1
-        node.value += reward
-        # Remove the virtual loss penalty applied during select
-        if node.virtual_loss > 0:
-            node.value -= virtual_loss_value  # undo the pessimistic contribution
-            node.virtual_loss -= 1
+    cur: Optional[MCTSNode] = node
+    while cur is not None:
+        cur.visits += 1
+        cur.value += reward
+        cur = cur.parent
     if profiler:
         profiler.stop("backprop")
 
@@ -1146,9 +1240,9 @@ def _search_one(args: tuple) -> tuple[list[dict], dict]:
     Picklable worker for one serial MCTS search in a child process.
 
     Receives the fragment library via shared memory (zero-copy Arrow IPC).
-    Runs a fully independent tree — no shared state with other workers.
-    Virtual loss is applied within the tree for PUCT quality but does not
-    coordinate across processes (each process has its own root).
+    The novelty penalty (if any) is applied to the library's CDFs at init
+    time so that fragments already heavily explored in previous waves are
+    sampled less frequently in this run.
     """
     (
         shm_name,
@@ -1165,7 +1259,8 @@ def _search_one(args: tuple) -> tuple[list[dict], dict]:
         use_dirichlet,
         score_threshold,
         conditional_records,
-        virtual_loss_value,
+        fragment_counts,
+        novelty_beta,
     ) = args
 
     library = FragmentLibrary.from_shared_memory(
@@ -1174,6 +1269,8 @@ def _search_one(args: tuple) -> tuple[list[dict], dict]:
         compat_map,
         temperature=temperature,
         conditional_records=conditional_records,
+        fragment_counts=fragment_counts,
+        novelty_beta=novelty_beta,
     )
     root = MCTSNode(state=MolState(target_n_blocks=target_n_blocks))
     profiler = MCTSProfiler()
@@ -1182,7 +1279,7 @@ def _search_one(args: tuple) -> tuple[list[dict], dict]:
     seen_smiles: set[str] = set()
 
     for _ in range(n_iter):
-        node, path = _select(root, library, ucb_c, virtual_loss_value, profiler)
+        node = _select(root, library, ucb_c, profiler)
         if not node.is_terminal():
             node = _expand(
                 node,
@@ -1193,15 +1290,11 @@ def _search_one(args: tuple) -> tuple[list[dict], dict]:
                 use_dirichlet,
                 profiler,
             )
-            # If _expand returned a new child, extend the path and apply VL
-            if node is not path[-1]:
-                node.virtual_loss += 1
-                path.append(node)
         terminal_state = _simulate(
             node.state.clone(), library, rollout_depth, temperature, profiler
         )
         reward = _score_state(terminal_state, score_fn, library, profiler)
-        _backpropagate(path, reward, virtual_loss_value, profiler)
+        _backpropagate(node, reward, profiler)
         if terminal_state.is_complete and reward >= score_threshold:
             smi = terminal_state.assembled_smiles(library)
             if smi not in seen_smiles:
@@ -1225,15 +1318,16 @@ def _search_one(args: tuple) -> tuple[list[dict], dict]:
 
 class MCTSDrugDesign:
     """
-    MCTS-based de novo drug designer — process parallelism (v14).
+    MCTS-based de novo drug designer — process parallelism with novelty penalty (v15).
 
     n_runs independent trees are searched in parallel via ProcessPoolExecutor.
     Each worker process receives the fragment library via shared memory and
     runs a fully serial MCTS loop, bypassing the GIL entirely.
 
-    Virtual loss (from v13) is preserved for within-run PUCT quality:
-    it makes the Q-value of recently-visited nodes temporarily pessimistic,
-    improving exploration even in a single-tree serial run.
+    Between waves, a fragment novelty penalty is computed from the fragments
+    already seen in collected molecules and applied to the library CDFs for
+    the next wave. Fragments that have been heavily explored are downweighted,
+    steering subsequent runs toward less-visited regions of fragment space.
 
     Parameters
     ----------
@@ -1250,9 +1344,12 @@ class MCTSDrugDesign:
     conditional_table  : pd.DataFrame | pa.Table | None
         Fragment transition counts. Columns: unique_id, next_unique_id,
         frequency, proba.
-    virtual_loss_value : float
-        Pessimistic reward applied to in-flight nodes during select (default -1.0).
-        Improves within-run PUCT exploration quality. 0.0 disables it.
+    novelty_beta       : float
+        Strength of the inter-wave novelty penalty (default 0.3).
+        The adjusted log-weight of fragment a is:
+            log(f_a + 1) / T  -  novelty_beta * log(seen_a + 1)
+        where seen_a is how many collected molecules contain fragment a.
+        0.0 disables the penalty. Typical range: 0.1 – 1.0.
     """
 
     def __init__(
@@ -1268,7 +1365,7 @@ class MCTSDrugDesign:
         score_fn=None,
         rollout_depth: int = 20,
         conditional_table=None,
-        virtual_loss_value: float = -1.0,
+        novelty_beta: float = 0.3,
     ):
         self._conditional_records: Optional[list] = (
             conditional_table.to_pandas().to_dict("records")  # pyright: ignore[reportOptionalMemberAccess]
@@ -1287,7 +1384,7 @@ class MCTSDrugDesign:
         self.ucb_c = ucb_c
         self.score_fn = score_fn or lipinski_score
         self.rollout_depth = rollout_depth
-        self.virtual_loss_value = virtual_loss_value
+        self.novelty_beta = novelty_beta
         self.profiler = MCTSProfiler()
 
     # ------------------------------------------------------------------ #
@@ -1311,17 +1408,18 @@ class MCTSDrugDesign:
         molecules above score_threshold are collected, or max_runs searches
         have been completed — whichever comes first.
 
-        Runs are submitted in waves of n_workers at a time so the compound
-        counter is checked between waves without cancelling in-flight work.
-        Each wave costs at most n_workers × n_iter iterations.
+        Runs are submitted in waves of n_workers at a time. After each wave,
+        fragment counts from all collected molecules are tallied and passed to
+        the next wave's workers, which apply a novelty penalty to their local
+        library CDFs. This steers each successive wave toward fragments not
+        yet heavily explored.
 
         Parameters
         ----------
         target_compounds : int
-            Stop early once this many unique molecules above score_threshold
-            have been collected across all completed runs. Default 300_000.
+            Stop early once this many unique molecules are collected.
         max_runs : int
-            Hard ceiling on total runs regardless of compound count. Default 200.
+            Hard ceiling on total runs regardless of compound count.
         n_jobs : int
             Worker processes. -1 = os.cpu_count(). Wave size = n_jobs.
         score_threshold : float
@@ -1330,11 +1428,22 @@ class MCTSDrugDesign:
         self.profiler = MCTSProfiler()
         n_workers = os.cpu_count() if n_jobs == -1 else max(1, n_jobs)
 
-        # Accumulate results and dedup incrementally so the target check
-        # is always against unique SMILES, not raw counts.
         seen: set[str] = set()
         unique: list[dict] = []
         runs_done = 0
+        # fragment_counts: unique_id -> total occurrences across all collected molecules
+        fragment_counts: dict[str, int] = {}
+
+        def _ingest(batch: list[dict]) -> None:
+            """Dedup, accumulate, and update fragment counts from one run."""
+            for r in batch:
+                if r["smiles"] not in seen:
+                    seen.add(r["smiles"])
+                    unique.append(r)
+                # Count every fragment in every collected molecule (above threshold),
+                # including duplicates, so heavily reused fragments accumulate faster.
+                for uid in r["fragment_ids"]:
+                    fragment_counts[uid] = fragment_counts.get(uid, 0) + 1
 
         def _make_args(shm_name, shm_bytes, target_n_blocks):
             return (
@@ -1352,30 +1461,23 @@ class MCTSDrugDesign:
                 use_dirichlet,
                 score_threshold,
                 self._conditional_records,
-                self.virtual_loss_value,
+                # snapshot of counts at wave submission time — immutable in worker
+                dict(fragment_counts),
+                self.novelty_beta,
             )
-
-        def _ingest(batch: list[dict]) -> None:
-            """Dedup and accumulate results from one completed run."""
-            for r in batch:
-                if r["smiles"] not in seen:
-                    seen.add(r["smiles"])
-                    unique.append(r)
 
         if n_workers == 1:
             # Serial path — useful for debugging.
             while runs_done < max_runs and len(unique) < target_compounds:
                 target_n_blocks = self.sampler.sample()
+                # Apply novelty penalty to the in-process library directly
+                if fragment_counts and self.novelty_beta > 0.0:
+                    self.library.apply_novelty_penalty(fragment_counts, self.novelty_beta)
                 root = MCTSNode(state=MolState(target_n_blocks=target_n_blocks))
-                seen_smiles: set[str] = set()
+                seen_run: set[str] = set()
+                batch: list[dict] = []
                 for _ in range(self.n_iter):
-                    node, path = _select(
-                        root,
-                        self.library,
-                        self.ucb_c,
-                        self.virtual_loss_value,
-                        self.profiler,
-                    )
+                    node = _select(root, self.library, self.ucb_c, self.profiler)
                     if not node.is_terminal():
                         node = _expand(
                             node,
@@ -1386,9 +1488,6 @@ class MCTSDrugDesign:
                             use_dirichlet,
                             self.profiler,
                         )
-                        if node is not path[-1]:
-                            node.virtual_loss += 1
-                            path.append(node)
                     terminal_state = _simulate(
                         node.state.clone(),
                         self.library,
@@ -1399,21 +1498,20 @@ class MCTSDrugDesign:
                     reward = _score_state(
                         terminal_state, self.score_fn, self.library, self.profiler
                     )
-                    _backpropagate(path, reward, self.virtual_loss_value, self.profiler)
+                    _backpropagate(node, reward, self.profiler)
                     if terminal_state.is_complete and reward >= score_threshold:
                         smi = terminal_state.assembled_smiles(self.library)
-                        if smi not in seen_smiles:
-                            seen_smiles.add(smi)
-                            _ingest(
-                                [
-                                    {
-                                        "smiles": smi,
-                                        "score": reward,
-                                        "n_blocks": terminal_state.n_blocks,
-                                        "fragment_ids": list(terminal_state._uid_chain),
-                                    }
-                                ]
+                        if smi not in seen_run:
+                            seen_run.add(smi)
+                            batch.append(
+                                {
+                                    "smiles": smi,
+                                    "score": reward,
+                                    "n_blocks": terminal_state.n_blocks,
+                                    "fragment_ids": list(terminal_state._uid_chain),
+                                }
                             )
+                _ingest(batch)
                 runs_done += 1
                 logger.info(
                     "Run %d done — %d unique molecules so far (target %d, max_runs %d)",
@@ -1437,8 +1535,8 @@ class MCTSDrugDesign:
             try:
                 with ProcessPoolExecutor(max_workers=n_workers) as pool:
                     while runs_done < max_runs and len(unique) < target_compounds:
-                        # Wave size: fill all workers, but don't exceed max_runs
                         wave = min(n_workers, max_runs - runs_done)  # pyright: ignore[reportArgumentType]
+                        # fragment_counts snapshot baked into args at submission time
                         wave_args = [
                             _make_args(shm.name, shm_bytes, self.sampler.sample())
                             for _ in range(wave)
@@ -1451,11 +1549,13 @@ class MCTSDrugDesign:
                         runs_done += wave
                         logger.info(
                             "Wave done — %d runs completed, "
-                            "%d unique molecules (target %d, budget %d)",
+                            "%d unique molecules (target %d, budget %d), "
+                            "%d distinct fragments penalised",
                             runs_done,
                             len(unique),
                             target_compounds,
                             max_runs,
+                            len(fragment_counts),
                         )
             finally:
                 shm.close()
