@@ -46,6 +46,10 @@ CUTS = {
     'tsmiles': [(6, 7), (7, 8)],
     'frag':    [(0, 1), (1, 2), (5, 6), (6, 7), (7, 8), (8, 10), (15, 16)],
     'safe':    [(1, 2), (5, 6), (6, 7), (7, 8), (8, 10)],
+    # bonds found by smiles_blocks.retrosynthesis.retrosynthetic_analysis on SMI,
+    # mapped from canonical atom idx back to `mol`'s atom order (see
+    # notebooks/3-er-smiles2block_custom.ipynb for the retrosynthetic analysis)
+    'blocks':  [(1, 2), (5, 6), (6, 7), (7, 8), (8, 10)],
 }
 
 
@@ -246,10 +250,20 @@ def dot_join(tokens, colours):
     return out_tok, out_col
 
 
+# SMILES blocks: retro-synthetic bonds found by
+# smiles_blocks.retrosynthesis.retrosynthetic_analysis on SMI, fragmented into
+# blocks by smiles_blocks.smiles_fragmentation.process_set_smiles (see
+# notebooks/3-er-smiles2block_custom.ipynb). Tokens are the literal
+# 'smiles_blocked' output (explicit-bond blocks of a randomized SMILES), not
+# canonicalised, since that is what the method actually produces.
+BLOCKS_TOKENS = 'C-O.C1-C=C-C(=C-C=1).C.N.C(=O).C1=C-C=C-C=C-1-Cl'.split('.')
+
 FRAG_COLS = [PAL[i % len(PAL)] for i in range(8)]
 SAFE_COLS = [PAL[SAFE_ORDER[k] % len(PAL)] for k in range(6)]
+BLOCKS_COLS = [PAL[i % len(PAL)] for i in range(len(BLOCKS_TOKENS))]
 FRAG_TOKENS, FRAG_COLS = dot_join(FRAG_TOKENS, FRAG_COLS)
 SAFE_TOKENS, SAFE_COLS = dot_join(SAFE_TOKENS, SAFE_COLS)
+BLOCKS_TOKENS, BLOCKS_COLS = dot_join(BLOCKS_TOKENS, BLOCKS_COLS)
 
 METHODS = [
     dict(name='t-SMILES',
@@ -265,6 +279,10 @@ METHODS = [
          cuts=[], groups=spe_atom_groups(),
          tokens=SPE_TOKENS, colours=[PAL[k % len(PAL)] for k in range(len(SPE_TOKENS))]),
 ]
+
+BLOCKS_METHOD = dict(name='SMILES blocks',
+                      cuts=CUTS['blocks'], groups=atom_groups(CUTS['blocks']),
+                      tokens=BLOCKS_TOKENS, colours=BLOCKS_COLS)
 
 def method_panel(letter, colx, col_w, y, M):
     """Render one method panel (molecule + name + tokens) at (colx, y). Returns bottom y."""
@@ -308,11 +326,13 @@ for row_letters, row_methods in [('bc', METHODS[:2]), ('de', METHODS[2:])]:
         colx = PAD + col * (COL_W + GUTTER)
         bottoms.append(method_panel(letter, colx, COL_W, y, M))
     y = max(bottoms)
-    if row_methods is not METHODS[2:]:
-        body.append(f'<line x1="{PAD}" y1="{y}" x2="{W - PAD}" y2="{y}" stroke="#e2e2e2"/>')
+    body.append(f'<line x1="{PAD}" y1="{y}" x2="{W - PAD}" y2="{y}" stroke="#e2e2e2"/>')
     y += 22
 
-H = y + PAD - 22
+# ---- panel (f): SMILES blocks, full width -----------------------------------
+y = method_panel('f', PAD, W - 2 * PAD, y, BLOCKS_METHOD)
+
+H = y + PAD
 svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
        f'viewBox="0 0 {W} {H}" font-family="Helvetica, Arial, sans-serif">',
        f'<rect width="{W}" height="{H}" fill="#ffffff"/>']
