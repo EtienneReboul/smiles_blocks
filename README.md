@@ -235,6 +235,132 @@ Or you can use the following SLURM script to increase the data parallelism with 
 sbatch hpc_scripts/computecanada_narval_smiles2block.sh
 ```
 
+## (Optional) Use a retrosynthesis planner instead of R-BRICS
+
+By default the cleavable bonds come from the R-BRICS SMARTS patterns, computed
+inline inside the fragmentation workers. A retrosynthesis planner such as
+AiZynthFinder can be used instead.
+
+### Why this is a separate stage
+
+R-BRICS costs microseconds per molecule; AiZynthFinder costs about 11.5 s. Running
+a tree search inside the fragmentation workers would mean redoing it on every job
+retry, and welding a CPU-bound search onto an I/O-bound pass over 65 GB of
+randomised SMILES. So the search runs as its own stage and writes its results to
+parquet, which the fragmentation stage reads back.
+
+The work unit is one `smiles_data` part. Each part holds ~57 M randomised rows but
+only **~16 300 unique reference SMILES**, which is what actually gets searched:
+
+| Quantity | Value |
+| --- | --- |
+| Unique reference SMILES per part | ~16 300 |
+| Search cost per molecule (1 core) | ~11.5 s |
+| Cost per part | ~52 core-hours |
+| Wall time per part on 64 cores | ~49 min |
+| Full MOSES (119 parts, 1.9 M molecules) | ~6 200 core-hours |
+
+A GPU does not help: the MCTS is CPU-bound and the policy network runs on ONNX
+Runtime.
+
+### Install AiZynthFinder
+
+AiZynthFinder 4.4.1 needs Python 3.11, so it lives in its own environment,
+separate from the one used for fragmentation. The two stages never share a
+process. On a login node (internet access is needed for the models):
+
+```bash
+bash hpc_scripts/caius_setup_aizynth_env.sh
+```
+
+This creates the conda env, installs `aizynthfinder[all]==4.4.1` with `pyarrow<20`
+(required because AiZynthFinder pins NumPy 1.x), downloads the public template
+models and the ZINC stock, and runs a single-molecule search to verify the
+install. It also reports which reaction metadata keys the model populates, which
+is what `--tag-keys` should be set from.
+
+### Run the search
+
+Locally, on one part, for testing:
+
+```bash
+python jobs_scripts/aizynth_cut_bonds.py \
+    --input data/processed/smiles_data/part-0.parquet \
+    --output data/interim/retro_cut_bonds/part-0.parquet \
+    --config models/aizynthfinder/config.yml \
+    --num-workers 8 \
+    --limit 100
+```
+
+On a SLURM cluster, as a 119-task array, **don't forget to set the proper
+`#SBATCH --account=your_account` and `--partition`**:
+
+```bash
+sbatch hpc_scripts/caius_aizynth_cut_bonds.sh
+```
+
+Results are flushed every 200 molecules, so a task killed by the time limit keeps
+what it finished; relaunch with `--resume` to search only what is missing. Note
+that this array is `0-118`, covering all 119 parts; the older scripts in
+`hpc_scripts/` use `1-118` and therefore skip `part-0`.
+
+### Generate blocks from the precomputed bonds
+
+Point `smiles2block.py` at the search output. Everything downstream is unchanged,
+including the output schemas:
+
+```bash
+python jobs_scripts/smiles2block.py \
+    --input data/processed/smiles_data/part-0.parquet \
+    --retro-backend precomputed \
+    --retro-bonds data/interim/retro_cut_bonds/part-0.parquet \
+    --output_folder data/interim/aizynth_blocks/
+```
+
+### Routes that come back without atom mapping
+
+The extraction above needs atom-mapped reactions. AiZynthFinder attaches that
+mapping to a route's steps only when the reaction was actually mapped, and a
+route without it would otherwise be discarded (`no_mapped_steps`).
+`smiles_blocks/retro_backends/unmapped.py` is the fallback for those routes: it
+recovers the disconnection from the molecules alone, by breaking each acyclic bond
+of the product and keeping the bond when its two fragments land in *different*
+precursors.
+
+```python
+from smiles_blocks.retro_backends.unmapped import UnmappedStep, unmapped_route_cut_bonds
+
+bonds = unmapped_route_cut_bonds(
+    "CC(=O)Nc1ccc(O)cc1",
+    [UnmappedStep("CC(=O)Nc1ccc(O)cc1", ("CC(=O)Cl", "Nc1ccc(O)cc1"), tag="amide")],
+)
+```
+
+This works through leaving groups — the acid chloride above carries a `Cl` the
+product never had, yet the `CC=O` fragment still matches inside it — and it agrees
+with the exact mapped extraction on the reactions tested.
+
+Its limit: without atom maps, only the step acting on the **target** can be placed,
+so deeper steps are skipped rather than guessed at. Prefer the mapped path whenever
+the mapping is available; it is exact rather than inferential.
+
+### Adding another planner
+
+The bond extraction in `smiles_blocks/retro_backends/bond_extraction.py` works
+from atom-mapped reaction SMILES alone, so a new planner needs only an adapter
+that yields `RouteStep` objects — or `UnmappedStep` objects if it provides no
+mapping.
+
+Two invariants matter for any backend:
+
+- Bond signatures are pairs of **canonical atom ranks** (`Chem.CanonicalRankAtoms`),
+  not atom indices, because the fragmentation side intersects them against the
+  bonds of randomised SMILES with different atom orderings.
+- **Atom maps must be stripped before ranking.** With maps present,
+  `CanonicalRankAtoms` returns the map numbering instead of the molecule's
+  canonical ranks, so every signature would be wrong and would silently fail to
+  intersect, giving `retro_bond_ratio = 0` with no error.
+
 ### (optional) Generate control blocks and fragmented SMILES libraries
 
 If you want to reproduce the results of the preprint, you cant do so locally in couple of hours using the following command :

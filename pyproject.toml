@@ -58,7 +58,7 @@ all = [
 ]
 
 [tool.setuptools]
-packages = ["smiles_blocks"]
+packages = ["smiles_blocks", "smiles_blocks.retro_backends"]
 
 
 [tool.ruff]

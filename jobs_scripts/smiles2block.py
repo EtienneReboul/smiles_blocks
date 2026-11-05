@@ -19,6 +19,7 @@ import pyarrow.parquet as pq
 from rdkit import RDLogger
 
 from smiles_blocks.files import INTERIM_DATA_DIR, PROCESSED_DATA_DIR, PROJ_ROOT
+from smiles_blocks.retro_backends.store import load_cut_bonds
 from smiles_blocks.retrosynthesis import retrosynthetic_analysis
 from smiles_blocks.smiles_fragmentation import (
     BlockedSmilesResult,
@@ -119,6 +120,30 @@ def smiles2block_argparse() -> dict:
         help="Number of batches to process per worker (default: 10)",
     )
 
+    # retrosynthesis backend
+    parser.add_argument(
+        "--retro-backend",
+        type=str,
+        default="rbrics",
+        choices=["rbrics", "precomputed"],
+        help=(
+            "Source of the cleavable bonds. 'rbrics' runs the SMARTS analysis inline "
+            "(microseconds per molecule). 'precomputed' reads bonds produced by a "
+            "separate search stage such as jobs_scripts/aizynth_cut_bonds.py, which "
+            "is the only workable option for backends costing seconds per molecule "
+            "(default: rbrics)"
+        ),
+    )
+    parser.add_argument(
+        "--retro-bonds",
+        type=str,
+        default=None,
+        help=(
+            "Parquet file or directory of precomputed cut bonds. Required when "
+            "--retro-backend precomputed"
+        ),
+    )
+
     # RDKit logging level
     parser.add_argument(
         "--rdkit-log-level",
@@ -131,7 +156,10 @@ def smiles2block_argparse() -> dict:
 
 
 def process_batch(
-    batch: list[str], shm: shared_memory.SharedMemory, smiles_regex: re.Pattern
+    batch: list[str],
+    shm: shared_memory.SharedMemory,
+    smiles_regex: re.Pattern,
+    retro_bonds: dict[str, dict] | None = None,
 ) -> tuple[pa.Table]:
     """
     This function is used to process a batch of SMILES and convert them to blocks
@@ -140,6 +168,11 @@ def process_batch(
         batch (list): a batch of SMILES
         shm (shared_memory.SharedMemory): the shared memory object containing the partition data
         smiles_regex (re.Pattern): the regex pattern to tokenize the SMILES
+        retro_bonds (dict[str, dict] | None): precomputed cleavable bonds keyed by
+            reference SMILES, from a separate retrosynthesis stage. When None, the
+            R-BRICS analysis is run inline instead. A molecule absent from the
+            mapping, or present with no bonds, is recorded as a retrosynthetic
+            failure exactly as an empty R-BRICS result would be.
 
     Returns:
         list: a list of blocks
@@ -155,7 +188,11 @@ def process_batch(
     for smiles in batch:
         # instantiate the result object for the current SMILES
 
-        retro_synth_results = retrosynthetic_analysis(smiles)
+        if retro_bonds is None:
+            retro_synth_results = retrosynthetic_analysis(smiles)
+        else:
+            retro_synth_results = retro_bonds.get(smiles, {})
+
         if not retro_synth_results:
             # if retrosynthetic analysis fails, we still want to record the SMILES in the blocked_smiles table with fragmentation_success = False and an empty block library
             blocked_smiles_results = vars(BlockedSmilesResult())
@@ -204,12 +241,15 @@ def process_partition(
     nb_batch_per_worker: int,
     block_library_path: Path,
     blocked_smiles_path: Path,
+    retro_bonds: dict[str, dict] | None = None,
 ) -> pa.Table:
     """
     This function is used to process a partition of the dataset and convert the SMILES to blocks
 
     Args:
         partition (pa.Table): a partition of the dataset
+        retro_bonds (dict[str, dict] | None): precomputed cleavable bonds keyed by
+            reference SMILES. None runs the R-BRICS analysis inline.
 
     Returns:
         pa.Table: a partition of the dataset with the blocks
@@ -243,7 +283,9 @@ def process_partition(
     del partition
 
     # create a partial function to process the batches with the shared memory and threshold dict
-    partial_process_batch = partial(process_batch, shm=shm, smiles_regex=smiles_regex)
+    partial_process_batch = partial(
+        process_batch, shm=shm, smiles_regex=smiles_regex, retro_bonds=retro_bonds
+    )
 
     # process the batches in parallel
     with mp.Pool(processes=nb_workers) as pool:
@@ -336,6 +378,13 @@ def main():
     # parse the arguments
     args = smiles2block_argparse()
 
+    # validate the retrosynthesis backend selection
+    if args["retro_backend"] == "precomputed" and not args["retro_bonds"]:
+        raise ValueError(
+            "--retro-backend precomputed requires --retro-bonds pointing at the output "
+            "of a retrosynthesis stage (e.g. jobs_scripts/aizynth_cut_bonds.py)"
+        )
+
     # set RDKit logging level
     lg = RDLogger.logger()
     rdkit_log_level = getattr(RDLogger, args["rdkit_log_level"].upper(), None)
@@ -382,6 +431,27 @@ def main():
 
         table = pq.read_table(file)
 
+        # load the precomputed cleavable bonds for this partition only, so a
+        # worker never carries the whole 1.9 M-molecule table
+        retro_bonds = None
+        if args["retro_backend"] == "precomputed":
+            partition_smiles = set(pc.unique(table["smiles"]).to_pylist())
+            retro_bonds = load_cut_bonds(args["retro_bonds"], ref_smiles=partition_smiles)
+            missing = len(partition_smiles) - len(retro_bonds)
+            logger.info(
+                "precomputed bonds: %d/%d molecules found, %d missing from %s",
+                len(retro_bonds),
+                len(partition_smiles),
+                missing,
+                args["retro_bonds"],
+            )
+            if not retro_bonds:
+                raise ValueError(
+                    f"no precomputed bonds matched the {len(partition_smiles)} reference "
+                    f"SMILES of {file_name} in {args['retro_bonds']}. The retrosynthesis "
+                    "stage was probably run on a different part of the dataset."
+                )
+
         # process the partition and convert the SMILES to blocks
         start = time.time()
         process_partition(
@@ -390,6 +460,7 @@ def main():
             nb_batch_per_worker=args["nb_batch_per_worker"],
             block_library_path=block_library_path / file_stem,
             blocked_smiles_path=blocked_smiles_path / file_stem,
+            retro_bonds=retro_bonds,
         )
         end = time.time()
         logger.info(f"Processing file {file_name} took {end - start:.2f} seconds")
