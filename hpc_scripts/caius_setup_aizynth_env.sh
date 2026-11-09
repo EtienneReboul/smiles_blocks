@@ -29,10 +29,22 @@ PROJECT_DIR="${PROJECT_DIR:-$HOME/projects/smiles_blocks}"
 ENV_PREFIX="${ENV_PREFIX:-$PROJECT_DIR/envs/aizynth}"
 MODEL_DIR="${MODEL_DIR:-$PROJECT_DIR/models/aizynthfinder}"
 
-# How to get a working conda/mamba on CAIUS. Replace with whatever applies:
-#   module load conda        (or miniconda/anaconda/mamba)
-#   source /path/to/conda/etc/profile.d/conda.sh
-CONDA_SETUP_CMD="${CONDA_SETUP_CMD:-}"
+# How to get a working conda/mamba on CAIUS. `module` is a shell function set up
+# by /etc/profile, so it does not exist in a non-login shell (nohup, sbatch);
+# the modules init has to be sourced first or `module load` is a command-not-found.
+CONDA_SETUP_CMD="${CONDA_SETUP_CMD:-module load python/Miniconda}"
+
+if ! command -v module >/dev/null 2>&1; then
+    # Environment Modules lives under /usr/local/Modules on CAIUS and is not in
+    # /etc/profile.d, so the init script is sourced by path.
+    for _init in "${MODULESHOME:-}/init/bash" /usr/local/Modules/latest/init/bash; do
+        if [ -r "$_init" ]; then
+            # shellcheck disable=SC1091
+            source "$_init"
+            break
+        fi
+    done
+fi
 # ======================================================================
 
 # Exported for the verification heredoc at the end.
@@ -64,7 +76,13 @@ if [ -d "$ENV_PREFIX" ]; then
     echo "== env already exists, reusing it"
 else
     echo "== creating Python 3.11 env"
-    "$CONDA_BIN" create --yes --prefix "$ENV_PREFIX" python=3.11 pip
+    # conda-forge only, via --override-channels: the Miniconda module ships with
+    # Anaconda's defaults channels, which now require accepting their commercial
+    # Terms of Service. conda-forge has everything needed (python + pip) and no
+    # such requirement, so the ToS prompt is sidestepped rather than accepted.
+    "$CONDA_BIN" create --yes --prefix "$ENV_PREFIX" \
+        --override-channels --channel conda-forge \
+        python=3.11 pip
 fi
 
 # shellcheck disable=SC1091
@@ -78,7 +96,12 @@ pip install --no-cache-dir \
     "pyarrow<20"
 
 echo "== installing smiles_blocks"
-pip install --no-cache-dir --no-deps -e "$PROJECT_DIR"
+# --ignore-requires-python: the package declares >=3.12 because the FRAGMENTATION
+# stage needs it, but aizynthfinder 4.4.1 caps out at 3.11. Stage A only imports
+# smiles_blocks.retro_backends, which needs nothing beyond rdkit and pyarrow and
+# compiles fine on 3.11. The two stages never share a process, so the real floor
+# is left truthful in pyproject.toml rather than lowered for this one env.
+pip install --no-cache-dir --no-deps --ignore-requires-python -e "$PROJECT_DIR"
 
 # ---------------------------------------------------------------------------
 # 3-4. Models and stock

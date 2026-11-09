@@ -234,6 +234,35 @@ def already_done(output_path: Path) -> set[str]:
         return set()
 
 
+#: Loggers that must be capped. AiZynthFinder raises its own logger to DEBUG when
+#: it builds a finder, and emits one record per template application -- hundreds
+#: of thousands per molecule. Those records propagate to the root handler, whose
+#: own level is NOTSET, so ``basicConfig(level=INFO)`` does NOT stop them: a
+#: single 16 k-molecule part wrote a 22 GB logfile (x119 tasks = 2.6 TB).
+_NOISY_LOGGERS = ("aizynthfinder", "route_distances", "rdkit", "rdApp")
+
+
+def quiet_third_party_logging(level: int = logging.WARNING) -> None:
+    """Stop AiZynthFinder's per-template DEBUG records reaching our logfile.
+
+    Must be called *after* a finder is built, since building one is what raises
+    those loggers to DEBUG. Caps the root handlers too, so a library that logs
+    through a logger not named here still cannot write DEBUG to the file.
+
+    Args:
+        level: Lowest level the noisy loggers may emit.
+    """
+    for name in _NOISY_LOGGERS:
+        third_party = logging.getLogger(name)
+        third_party.setLevel(level)
+        third_party.propagate = False
+
+    # Belt and braces: a handler with NOTSET emits whatever any logger passes it.
+    for handler in logging.getLogger().handlers:
+        if handler.level < logging.INFO:
+            handler.setLevel(logging.INFO)
+
+
 def init_worker(
     config: str, expansion: str | None, stock: str | None, search_kwargs: dict
 ) -> None:
@@ -250,6 +279,8 @@ def init_worker(
     """
     global _FINDER, _SEARCH_KWARGS
     _FINDER = load_finder(config, expansion=expansion, stock=stock)
+    # After load_finder, which is what turns the DEBUG firehose on.
+    quiet_third_party_logging()
     _SEARCH_KWARGS = search_kwargs
 
 
@@ -343,6 +374,9 @@ def main() -> None:
         format="%(asctime)s - %(levelname)s - %(message)s",
         force=True,
     )
+    # Also in the parent: inspect_metadata and any main-process search would
+    # otherwise reopen the DEBUG firehose.
+    quiet_third_party_logging()
 
     output_path = Path(args["output"])
     output_path.parent.mkdir(parents=True, exist_ok=True)
