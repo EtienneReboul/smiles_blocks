@@ -200,3 +200,5 @@ cython_debug/
 
 # feed back markdown 
 PI_comments_by_section.md
+# Hold-out validation / sweep per-molecule results (large; archived on Zenodo)
+/reports/modeling_results/**/*.parquet
