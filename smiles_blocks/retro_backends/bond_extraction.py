@@ -241,9 +241,16 @@ def build_mapnum_to_rank(target_mol: Chem.Mol, mapped_product: Chem.Mol) -> dict
     return mapnum_to_rank
 
 
+#: Keys :func:`route_cut_bonds` fills when given a ``stats`` dict. ``proposed``
+#: counts every cut the route suggested; the rest say what became of each.
+CUT_STATS_KEYS = ("proposed", "kept", "dropped_ring", "dropped_not_bonded", "dropped_unmapped")
+
+
 def route_cut_bonds(
     target_smiles: str,
     steps: list[RouteStep],
+    stats: dict[str, int] | None = None,
+    dropped_ring_bonds: list[dict] | None = None,
 ) -> dict[frozenset[int], dict[int, set[str]]]:
     """Convert a whole retrosynthetic route into cleavable bonds on the target.
 
@@ -261,6 +268,16 @@ def route_cut_bonds(
         target_smiles: The reference SMILES being fragmented.
         steps: The route's steps. Order is irrelevant; the root is located by
             comparing each step's product with the target.
+        stats: Optional counter, incremented in place with the keys in
+            :data:`CUT_STATS_KEYS`. Use it to measure how much a route loses to
+            the acyclic-only restriction; the counts are per cut, not per bond,
+            so a bond proposed by two steps counts twice.
+        dropped_ring_bonds: Optional sink, appended to in place with one record
+            per cut discarded for being a ring bond: the two canonical ranks,
+            the size of the smallest ring the bond belongs to, and whether it is
+            aromatic. Pass one to characterise what the restriction loses, not
+            merely how much; like ``stats`` these are per cut, so the same bond
+            proposed twice is recorded twice.
 
     Returns:
         dict[frozenset[int], dict[int, set[str]]]: Bond signature (pair of
@@ -304,18 +321,47 @@ def route_cut_bonds(
         tag = sanitize_tag(step.tag)
 
         for mapnum_pair in cut_mapnums:
+            if stats is not None:
+                stats["proposed"] = stats.get("proposed", 0) + 1
+
             # A bond cut on an intermediate may involve an atom pair that is not
             # bonded in the target at all; such a cut is not expressible as a
             # string cut and is dropped.
             if len(mapnum_pair) != 2:
+                if stats is not None:
+                    stats["dropped_unmapped"] = stats.get("dropped_unmapped", 0) + 1
                 continue
             ranks = [mapnum_to_rank.get(mapnum) for mapnum in mapnum_pair]
             if any(rank is None for rank in ranks):
+                if stats is not None:
+                    stats["dropped_unmapped"] = stats.get("dropped_unmapped", 0) + 1
                 continue
 
             bond = target_mol.GetBondBetweenAtoms(rank_to_idx[ranks[0]], rank_to_idx[ranks[1]])
-            if bond is None or bond.IsInRing():
+            if bond is None:
+                if stats is not None:
+                    stats["dropped_not_bonded"] = stats.get("dropped_not_bonded", 0) + 1
                 continue
+            if bond.IsInRing():
+                # The load-bearing exclusion: a ring bond cannot be cleaved in a
+                # SMILES string, so ring-forming/opening steps contribute nothing.
+                if stats is not None:
+                    stats["dropped_ring"] = stats.get("dropped_ring", 0) + 1
+                if dropped_ring_bonds is not None:
+                    dropped_ring_bonds.append(
+                        {
+                            "rank_a": int(min(ranks)),
+                            "rank_b": int(max(ranks)),
+                            "ring_size": int(
+                                target_mol.GetRingInfo().MinBondRingSize(bond.GetIdx())
+                            ),
+                            "aromatic": bool(bond.GetIsAromatic()),
+                        }
+                    )
+                continue
+
+            if stats is not None:
+                stats["kept"] = stats.get("kept", 0) + 1
 
             signature = frozenset(ranks)
             bonds[signature][ranks[0]].add(tag)

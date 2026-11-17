@@ -1,0 +1,35 @@
+{
+  "parts": 119,
+  "molecules": 1936962,
+  "solved": 1580410,
+  "cuts_proposed": 2491656,
+  "cuts_kept": 1762970,
+  "cuts_dropped_ring": 612004,
+  "cuts_dropped_not_bonded": 15069,
+  "cuts_dropped_unmapped": 101613,
+  "molecules_with_a_ring_cut": 269095,
+  "molecules_losing_everything_to_rings": 114883,
+  "molecules_losing_everything_any_cause": 114883,
+  "pct_cuts_lost_to_rings": 24.562,
+  "pct_cuts_kept": 70.755,
+  "pct_solved": 81.592,
+  "pct_solved_mols_with_a_ring_cut": 17.027,
+  "pct_solved_mols_losing_all_to_rings": 7.269,
+  "ci95_pct_solved_mols_with_a_ring_cut": [
+    16.968,
+    17.086
+  ],
+  "ci95_pct_solved_mols_losing_all_to_rings": [
+    7.229,
+    7.31
+  ],
+  "dropped_ring_by_size": {
+    "3": 21019,
+    "4": 1301,
+    "5": 379876,
+    "6": 206143,
+    "7": 3665
+  },
+  "dropped_ring_aromatic": 335491,
+  "pct_dropped_ring_aromatic": 54.818
+}

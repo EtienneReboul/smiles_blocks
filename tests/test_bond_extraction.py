@@ -389,3 +389,102 @@ class TestFragmentationCompatibility:
     def test_thresholds_unchanged(self):
         """Block quality assessment is backend-independent."""
         assert ExtendedRoThreeThreshold().MolWt == 300
+
+
+class TestCutStatsAndDroppedRingBonds:
+    """The instrumentation that quantifies the acyclic-only restriction.
+
+    The counters and the ring-bond sink are the only record of a discarded cut:
+    the stored output keeps survivors only, so a bug here is invisible in the
+    data and would silently misstate the limitation in the paper.
+    """
+
+    def test_counters_account_for_every_proposed_cut(self):
+        steps = [RouteStep(make_mapped_retro(PARACETAMOL, [PARACETAMOL_AMIDE]))]
+        stats: dict[str, int] = {}
+        route_cut_bonds(PARACETAMOL, steps, stats=stats)
+        assert stats["proposed"] == 1
+        assert stats["kept"] == 1
+        accounted = (
+            stats.get("kept", 0)
+            + stats.get("dropped_ring", 0)
+            + stats.get("dropped_not_bonded", 0)
+            + stats.get("dropped_unmapped", 0)
+        )
+        assert accounted == stats["proposed"]
+
+    def test_ring_cut_is_counted_as_a_ring_drop(self):
+        cyclohexane = "C1CCCCC1"
+        steps = [RouteStep(make_mapped_retro(cyclohexane, [(0, 1)]))]
+        stats: dict[str, int] = {}
+        assert route_cut_bonds(cyclohexane, steps, stats=stats) == {}
+        assert stats["proposed"] == 1
+        assert stats["dropped_ring"] == 1
+        assert stats.get("kept", 0) == 0
+
+    def test_sink_records_ring_size_and_aliphatic_bond(self):
+        cyclohexane = "C1CCCCC1"
+        steps = [RouteStep(make_mapped_retro(cyclohexane, [(0, 1)]))]
+        dropped: list[dict] = []
+        route_cut_bonds(cyclohexane, steps, dropped_ring_bonds=dropped)
+        assert len(dropped) == 1
+        assert dropped[0]["ring_size"] == 6
+        assert dropped[0]["aromatic"] is False
+        assert dropped[0]["rank_a"] < dropped[0]["rank_b"], "ranks are ordered, so rows dedupe"
+
+    def test_sink_marks_an_aromatic_ring_bond(self):
+        biphenyl = "c1ccc(-c2ccccc2)cc1"
+        mol = Chem.MolFromSmiles(biphenyl)
+        ring_bond = next(
+            (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+            for bond in mol.GetBonds()
+            if bond.IsInRing()
+        )
+        steps = [RouteStep(make_mapped_retro(biphenyl, [ring_bond]))]
+        dropped: list[dict] = []
+        route_cut_bonds(biphenyl, steps, dropped_ring_bonds=dropped)
+        assert len(dropped) == 1
+        assert dropped[0]["aromatic"] is True
+        assert dropped[0]["ring_size"] == 6
+
+    def test_smallest_ring_is_reported_for_a_fused_system(self):
+        """Indane: the shared bond belongs to a 5- and a 6-ring; 5 is reported."""
+        indane = "C1Cc2ccccc2C1"
+        mol = Chem.MolFromSmiles(indane)
+        ring_info = mol.GetRingInfo()
+        shared = next(
+            (bond.GetBeginAtomIdx(), bond.GetEndAtomIdx())
+            for bond in mol.GetBonds()
+            if ring_info.NumBondRings(bond.GetIdx()) > 1
+        )
+        steps = [RouteStep(make_mapped_retro(indane, [shared]))]
+        dropped: list[dict] = []
+        route_cut_bonds(indane, steps, dropped_ring_bonds=dropped)
+        assert len(dropped) == 1
+        assert dropped[0]["ring_size"] == 5
+
+    def test_sink_stays_empty_for_an_acyclic_cut(self):
+        steps = [RouteStep(make_mapped_retro(PARACETAMOL, [PARACETAMOL_AMIDE]))]
+        dropped: list[dict] = []
+        assert route_cut_bonds(PARACETAMOL, steps, dropped_ring_bonds=dropped)
+        assert dropped == []
+
+    def test_instrumentation_does_not_change_the_result(self):
+        """Opt-in means opt-in: the bonds returned must be identical."""
+        steps = [RouteStep(make_mapped_retro(PARACETAMOL, [PARACETAMOL_AMIDE]))]
+        plain = route_cut_bonds(PARACETAMOL, steps)
+        instrumented = route_cut_bonds(PARACETAMOL, steps, stats={}, dropped_ring_bonds=[])
+        assert plain == instrumented
+
+    def test_sink_length_matches_the_counter(self):
+        """Two ring cuts in one route: both counted, both recorded."""
+        cyclohexane = "C1CCCCC1"
+        steps = [
+            RouteStep(make_mapped_retro(cyclohexane, [(0, 1)])),
+            RouteStep(make_mapped_retro(cyclohexane, [(2, 3)])),
+        ]
+        stats: dict[str, int] = {}
+        dropped: list[dict] = []
+        route_cut_bonds(cyclohexane, steps, stats=stats, dropped_ring_bonds=dropped)
+        assert stats["dropped_ring"] == 2
+        assert len(dropped) == 2

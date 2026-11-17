@@ -1,0 +1,17 @@
+{
+  "sample": 5000,
+  "seed": 20261110,
+  "solved": 4041,
+  "cuts_proposed": 6430,
+  "cuts_kept": 4528,
+  "cuts_dropped_ring": 1596,
+  "cuts_dropped_not_bonded": 30,
+  "cuts_dropped_unmapped": 276,
+  "molecules_with_a_ring_cut": 711,
+  "molecules_losing_everything_to_rings": 293,
+  "wall_min": 70.2,
+  "pct_cuts_lost_to_rings": 24.82,
+  "pct_cuts_kept": 70.42,
+  "pct_solved_mols_with_a_ring_cut": 17.59,
+  "pct_solved_mols_losing_all_to_rings": 7.25
+}
