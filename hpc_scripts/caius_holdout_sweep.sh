@@ -5,9 +5,13 @@
 #
 #   sbatch hpc_scripts/caius_holdout_sweep.sh
 #
+# Each task also runs the fixed-budget / cross-replica hold-out test
+# (smiles_generation_holdout.py) for its part, so one submission refreshes both.
+#
 # then, once all tasks are done (on CAIUS or after copying the parts back):
 #
 #   python jobs_scripts/aggregate_holdout_sweep.py
+#   python jobs_scripts/smiles_generation_holdout.py --n_molecules 0 --summary_only
 #
 # Prerequisites on CAIUS:
 #   - data/processed/modelling_data/part-{0..118}.parquet (576 MB) copied over,
@@ -20,10 +24,10 @@
 # 100 fractions x 4 models). Fits are cached on the training set (consecutive
 # fractions often share one, because the sampling grid is log-spaced).
 #
-# Measured locally (14 cores, Apple M-series): 1 000 molecules in ~2 s of fitting,
-# i.e. ~1 min per part and ~10 core-hours for all of MOSES. 24 cores and a 1 h
-# limit per task are therefore very generous; the limit covers slow nodes and
-# shared-filesystem reads.
+# Models: smiles_blocks.modelling.FINAL_MODELS (exp, weibull, hill, lomax).
+# Measured: 2-parameter set ran in ~75 s per part on CAIUS (job 18610923); the
+# 3-parameter Weibull/Hill fits are ~3-4x slower (1 000 molecules in ~7 s on 14
+# local cores), i.e. ~3-5 min per part. A 2 h limit leaves a wide margin.
 #
 # Output: data/processed/holdout_sweep/part-<i>.parquet, ~32 MB each (~4 GB in
 # total), one row per (molecule, fraction, function).
@@ -40,7 +44,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=24
-#SBATCH --time=0-01:00
+#SBATCH --time=0-02:00
 #SBATCH --output=logs/holdout_sweep/job_%A_task_%a.out
 #SBATCH --error=logs/holdout_sweep/job_%A_task_%a.err
 
@@ -127,5 +131,13 @@ python jobs_scripts/smiles_generation_holdout_sweep.py \
     --output "$OUTPUT" \
     --nb-workers "$NUM_WORKERS" \
     --logfile "$LOGDIR/job_${SLURM_ARRAY_JOB_ID:-local}_task_${TASK_ID}.log"
+
+# Fixed-budget and cross-replica hold-out for the same part (per-part output only;
+# the summary CSVs are built once every part exists, with --summary_only).
+python jobs_scripts/smiles_generation_holdout.py \
+    --n_molecules 0 \
+    --parts "$TASK_ID" \
+    --skip_summary \
+    --nb_workers "$NUM_WORKERS"
 
 echo "task $TASK_ID complete"

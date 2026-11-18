@@ -19,11 +19,11 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from smiles_blocks.files import FIGURES_DIR, PROCESSED_DATA_DIR, REPORTS_DIR
-from smiles_blocks.modelling import ModelsRegistry
+from smiles_blocks.modelling import FINAL_MODELS, ModelsRegistry
 
-# inverse2 is a reparameterisation of inverse (identical predictions) -> dropped
-MODELS = {"exp": "Exponential", "inverse": "Inverse", "log": "Logarithmic", "sqrt": "Square root"}
-COLORS = {"exp": "#2a78d6", "inverse": "#eb6834", "log": "#1baf7a", "sqrt": "#eda100"}
+_REG = ModelsRegistry().models
+MODELS = {f: _REG[f].name for f in FINAL_MODELS}
+COLORS = dict(zip(FINAL_MODELS, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]))
 INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 
 
@@ -82,33 +82,28 @@ def main():
 
     full = [box_stats(one_minus_r2("full", f), "") for f in keys]
     rep = [box_stats(one_minus_r2("replica", f), "") for f in keys]
-    med_r2 = [1 - r["med"] for r in rep]
     x = np.arange(len(keys))
     draw_boxes(axA, full, x - 0.19, [COLORS[f] for f in keys])
     draw_boxes(axA, rep, x + 0.19, [COLORS[f] for f in keys], hatch="////")
-    for i, f in enumerate(keys):
-        axA.text(x[i] + 0.19, rep[i]["whishi"] * 1.25, f"R² = {med_r2[i]:.4f}", ha="center",
-                 va="bottom", fontsize=7, color=INK2)
     axA.set_xticks(x, [MODELS[f] for f in keys], color=INK)
     axA.set_yscale("log")
     axA.set_ylabel("1 − R² per molecule\n(lower is better)", color=INK)
-    axA.set_ylim(1e-4, 5)
     axA.set_title("A   Fit on replica 0, scored on independent replicas 1–2",
                   loc="left", fontsize=9, color=INK, fontweight="bold")
     axA.legend(handles=[
         plt.Rectangle((0, 0), 1, 1, fc=INK2, ec=INK2, label="In-sample (all replicas, original protocol)"),
-        plt.Rectangle((0, 0), 1, 1, fc="white", ec=INK2, hatch="////", label="Held-out replicas (median R² shown)"),
+        plt.Rectangle((0, 0), 1, 1, fc="white", ec=INK2, hatch="////", label="Held-out replicas"),
     ], frameon=False, fontsize=7, loc="upper left")
     style_axis(axA)
 
     # ---- B: plateau error vs sampling budget ------------------------------------------
     budgets = sorted({int(s.split("_")[1]) for s in res.scheme.unique() if s.startswith("budget")})
-    keysB = ["exp", "inverse", "log"]  # sqrt is off-scale (>+200%), reported in text
-    offs = np.linspace(-0.26, 0.26, len(keysB))
+    keysB = keys
+    offs = np.linspace(-0.3, 0.3, len(keysB))
     for j, f in enumerate(keysB):
         st = [box_stats(100 * res[(res.scheme == f"budget_{b}") & (res.function == f)].plateau_rel_err, "")
               for b in budgets]
-        draw_boxes(axB, st, np.arange(len(budgets)) + offs[j], [COLORS[f]] * len(budgets), width=0.22)
+        draw_boxes(axB, st, np.arange(len(budgets)) + offs[j], [COLORS[f]] * len(budgets), width=0.17)
     cov = [res[(res.scheme == f"budget_{b}") & (res.function == "exp")].train_coverage.median()
            for b in budgets]
     axB.set_xticks(range(len(budgets)),
@@ -116,7 +111,6 @@ def main():
     axB.axhline(0, color=INK2, lw=0.8)
     axB.set_xlabel("Draws used for fitting\n(median share of plateau already observed)", color=INK)
     axB.set_ylabel("Predicted vs observed plateau (%)", color=INK)
-    axB.set_ylim(-100, 80)
     axB.set_title("B   Extrapolating from early sampling", loc="left", fontsize=9,
                   color=INK, fontweight="bold")
     axB.legend(handles=[plt.Rectangle((0, 0), 1, 1, fc=COLORS[f], ec=COLORS[f], label=MODELS[f])
@@ -140,7 +134,7 @@ def main():
     reg = ModelsRegistry().models
     for f in keys:
         m = reg[f]
-        popt, _ = m.fit(xs[tr], ys[tr], p0=[ys[tr].max(), 1.0], maxfev=10_000)
+        popt, _ = m.fit(xs[tr], ys[tr], maxfev=10_000)
         axC.plot(grid, m.predict(grid, *popt), color=COLORS[f], lw=1.6, label=MODELS[f])
     axC.set_xscale("log")
     axC.set_ylim(0, ys.max() * 2.3)
@@ -151,8 +145,7 @@ def main():
     axC.legend(frameon=False, fontsize=6.5, loc="upper left", ncol=1)
     style_axis(axC)
 
-    fig.text(0.01, -0.04, f"n = {n_mol:,} MOSES molecules. Boxes: IQR; whiskers: 5th–95th percentile.",
-             fontsize=6.5, color=INK2)
+    print(f"n = {n_mol:,} molecules; boxes: IQR, whiskers: 5th-95th percentile")
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(a.out, bbox_inches="tight")
     fig.savefig(Path(a.out).with_suffix(".png"), dpi=200, bbox_inches="tight")

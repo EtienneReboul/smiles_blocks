@@ -20,13 +20,19 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
 import pyarrow.compute as pc
 import pyarrow.dataset as ds
 
-FUNCTIONS = ["exp", "inverse", "log", "sqrt"]
+PROJ_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJ_ROOT))
+
+from smiles_blocks.modelling import FINAL_MODELS  # noqa: E402
+
+FUNCTIONS = list(FINAL_MODELS)
 TOLERANCES = [0.20, 0.10, 0.05, 0.01]
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 
@@ -76,6 +82,8 @@ def main():
             "n": g.size(),
             "fit_fail_rate": 1 - g.fit_ok.mean(),
             "train_coverage_median": g.train_coverage.median(),
+            # share of molecules whose observed plateau is already in the training part
+            "plateau_reached": g.train_coverage.apply(lambda x: (x >= 1 - 1e-6).mean()),
             "within_5pct": g.abs_err.apply(lambda x: (x <= 0.05).mean()),
             "within_10pct": g.abs_err.apply(lambda x: (x <= 0.10).mean()),
             "abs_err_median": g.abs_err.median(),

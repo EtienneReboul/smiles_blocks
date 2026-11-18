@@ -3,11 +3,10 @@ Figure: convergence of the saturation models as more of the sampling budget is u
 
 A. Predicted vs observed plateau (median and IQR across molecules) as a function
    of the share of the sampling budget used for fitting.
-B. Share of molecules whose predicted plateau is within +/-10 %, with the median
-   share of the plateau already observed at that budget for reference.
+B. Share of molecules whose predicted plateau is within +/-5 % (--tolerance-b).
 C. Cumulative distribution of the budget needed for STABLE convergence: the
-   smallest share from which the prediction stays within +/-10 % for every
-   larger share.
+   smallest share from which the prediction stays within +/-5 % (--tolerance)
+   for every larger share.
 
 Reads the outputs of ``aggregate_holdout_sweep.py``.
 """
@@ -21,10 +20,14 @@ import numpy as np
 import pandas as pd
 
 from smiles_blocks.files import FIGURES_DIR, REPORTS_DIR
+from smiles_blocks.modelling import FINAL_MODELS, ModelsRegistry
 
-MODELS = {"exp": "Exponential", "inverse": "Inverse", "log": "Logarithmic", "sqrt": "Square root"}
-COLORS = {"exp": "#2a78d6", "inverse": "#eb6834", "log": "#1baf7a", "sqrt": "#eda100"}
-INK, INK2, GRID = "#0b0b0b", "#52514e", "#e4e3df"
+_REG = ModelsRegistry().models
+MODELS = {f: _REG[f].name for f in FINAL_MODELS}
+COLORS = dict(zip(FINAL_MODELS, ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]))
+REACHED_COLOR = "#e87ba4"  # categorical slot 5
+REACHED_LABEL = "Plateau already observed"
+INK, INK2, GRID ="#0b0b0b", "#52514e", "#e4e3df"
 PCT = FuncFormatter(lambda v, _: f"{v:g}%")
 
 
@@ -50,8 +53,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--input-dir", default=str(REPORTS_DIR / "modeling_results" / "holdout_sweep"))
     p.add_argument("--out", default=str(FIGURES_DIR / "modeling_results" / "modeling_holdout_sweep.svg"))
-    p.add_argument("--tolerance", type=int, default=10, help="Convergence tolerance in %% (panels A/C).")
-    p.add_argument("--tolerance-b", type=int, default=10, choices=[5, 10],
+    p.add_argument("--tolerance", type=int, default=5, help="Convergence tolerance in %% (panels A/C).")
+    p.add_argument("--tolerance-b", type=int, default=5, choices=[5, 10],
                    help="Accuracy tolerance in %% for panel B.")
     a = p.parse_args()
 
@@ -65,8 +68,8 @@ def main():
     plt.rcParams.update({"font.size": 8, "font.family": "sans-serif", "svg.fonttype": "none"})
     fig, (axA, axB, axC) = plt.subplots(1, 3, figsize=(10.5, 3.4), gridspec_kw={"wspace": 0.32})
 
-    # ---- A: signed plateau error, median + IQR (sqrt off-scale) -------------------------
-    for f in ["exp", "inverse", "log"]:
+    # ---- A: signed plateau error, median + IQR ------------------------------------------
+    for f in MODELS:
         g = s[s.function == f].sort_values("fraction")
         axA.fill_between(g.fraction, 100 * g.plateau_rel_err_q25, 100 * g.plateau_rel_err_q75,
                          color=COLORS[f], alpha=0.18, lw=0)
@@ -74,7 +77,7 @@ def main():
     axA.axhline(0, color=INK2, lw=0.8)
     axA.axhspan(-a.tolerance, a.tolerance, color=INK2, alpha=0.06, lw=0)
     budget_axis(axA)
-    axA.set_ylim(-75, 75)
+    axA.set_ylim(-30, 60)
     axA.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:+g}%" if v else "0%"))
     axA.set_ylabel("Predicted vs observed plateau", color=INK)
     axA.set_title("A   Plateau estimate (median, IQR)", loc="left", fontsize=9, color=INK,
@@ -108,8 +111,15 @@ def main():
                   fontweight="bold")
     style_axis(axC)
 
+    # ---- B/C reference: share of molecules whose plateau is already observed ------------
+    reached = s[s.function == FINAL_MODELS[0]].sort_values("fraction")
+    for ax in (axB, axC):
+        ax.plot(reached.fraction, 100 * reached.plateau_reached, color=REACHED_COLOR, lw=2,
+                label=REACHED_LABEL)
+
     handles = [plt.Line2D([], [], color=COLORS[f], lw=2, label=MODELS[f]) for f in MODELS]
-    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.07), ncol=4,
+    handles.append(plt.Line2D([], [], color=REACHED_COLOR, lw=2, label=REACHED_LABEL))
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 1.07), ncol=5,
                frameon=False, fontsize=8)
     print(f"n = {n_mol:,} molecules")
     Path(a.out).parent.mkdir(parents=True, exist_ok=True)

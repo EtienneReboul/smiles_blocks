@@ -2,12 +2,16 @@ import numpy as np
 import pytest
 
 from smiles_blocks.modelling import (
+    FINAL_MODELS,
     ExponentialModel,
+    HillModel,
     Inverse2Model,
     InverseModel,
     LogarithmicModel,
+    LomaxModel,
     ModelsRegistry,
     SquareRootModel,
+    WeibullModel,
 )
 
 
@@ -135,7 +139,63 @@ class TestExponentialModel:
         assert popt[1] == pytest.approx(0.5, rel=0.2)
 
 
+class TestWeibullModel:
+    def test_reduces_to_exponential_when_gamma_is_one(self):
+        x = np.array([1.0, 10.0, 100.0, 1000.0])
+        np.testing.assert_allclose(
+            WeibullModel().func(x, 50, 0.01, 1.0), ExponentialModel().func(x, 50, 0.01)
+        )
+
+    def test_fit_recovers_parameters(self):
+        model = WeibullModel()
+        x = np.logspace(0, 5, 60)
+        y = model.func(x, 5000, 1e-3, 0.9)
+        popt, _ = model.fit(x, y)
+        assert len(popt) == 3
+        np.testing.assert_allclose(popt, [5000, 1e-3, 0.9], rtol=1e-3)
+
+
+class TestHillModel:
+    def test_half_max_at_beta(self):
+        assert HillModel().func(np.array([200.0]), 10, 200, 1.3)[0] == pytest.approx(5)
+
+    def test_fit_recovers_parameters(self):
+        model = HillModel()
+        x = np.logspace(0, 5, 60)
+        y = model.func(x, 5000, 800, 1.25)
+        popt, _ = model.fit(x, y)
+        assert len(popt) == 3
+        np.testing.assert_allclose(popt, [5000, 800, 1.25], rtol=1e-3)
+
+
+class TestLomaxModel:
+    def test_reduces_to_inverse2_when_gamma_is_one(self):
+        x = np.array([1.0, 10.0, 100.0, 1000.0])
+        beta = 0.01
+        np.testing.assert_allclose(
+            LomaxModel().func(x, 50, beta, 1.0), Inverse2Model().func(x, 50, 1 / beta)
+        )
+
+    def test_fit_recovers_parameters(self):
+        model = LomaxModel()
+        x = np.logspace(0, 5, 60)
+        y = model.func(x, 5000, 5e-4, 4.0)
+        popt, _ = model.fit(x, y)
+        assert len(popt) == 3
+        np.testing.assert_allclose(popt, [5000, 5e-4, 4.0], rtol=1e-3)
+
+
 class TestModelsRegistry:
+    def test_final_models_are_registered(self):
+        registry = ModelsRegistry()
+        assert all(name in registry.models for name in FINAL_MODELS)
+
+    def test_initial_guess_matches_parameter_count(self):
+        x = np.logspace(0, 4, 20)
+        y = 100 * (1 - np.exp(-x / 300))
+        for model in ModelsRegistry().models.values():
+            assert len(model.initial_guess(x, y)) == model.n_params
+
     def test_registry_contains_all_models(self):
         registry = ModelsRegistry()
         assert "sqrt" in registry.models

@@ -24,7 +24,7 @@ Output: one row per (molecule, fraction, function) with
 - plateau_rel_err: (prediction at the last sampled budget - plateau) / plateau
 - r2_full_from_train: R^2 over the full trajectory with the truncated-fit params
 - nrmse_test: RMSE on held-out observations / plateau (NaN at 100 %)
-- fit_ok: whether the fit succeeded (fewer than 3 points counts as a failure)
+- fit_ok: whether the fit succeeded (fewer than n_params + 1 points counts as a failure)
 """
 
 from __future__ import annotations
@@ -44,11 +44,10 @@ import pyarrow.parquet as pq
 PROJ_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJ_ROOT))
 
-from smiles_blocks.modelling import ModelsRegistry  # noqa: E402
+from smiles_blocks.modelling import FINAL_MODELS, ModelsRegistry  # noqa: E402
 
-# inverse2 is a reparameterisation of inverse (identical predictions), so it is skipped
-FUNCTIONS = ["exp", "inverse", "log", "sqrt"]
-MODELS = {k: v for k, v in ModelsRegistry().models.items() if k in FUNCTIONS}
+FUNCTIONS = list(FINAL_MODELS)
+MODELS = {k: ModelsRegistry().models[k] for k in FUNCTIONS}
 METRICS = ["train_coverage", "plateau_rel_err", "r2_full_from_train", "nrmse_test"]
 
 SCHEMA = pa.schema([
@@ -64,12 +63,12 @@ SCHEMA = pa.schema([
 
 def _fit_and_score(model, x, y, tr, plateau, x_last):
     """Return (fit_ok, plateau_rel_err, r2_full_from_train, nrmse_test)."""
-    if tr.sum() < 3:
+    if tr.sum() < model.n_params + 1:
         return False, np.nan, np.nan, np.nan
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            popt, _ = model.fit(x[tr], y[tr], p0=[y[tr].max(), 1.0], maxfev=10_000)
+            popt, _ = model.fit(x[tr], y[tr], maxfev=10_000)  # per-model initial guess and bounds
             if not np.all(np.isfinite(popt)):
                 return False, np.nan, np.nan, np.nan
             pred = model.predict(x, *popt)

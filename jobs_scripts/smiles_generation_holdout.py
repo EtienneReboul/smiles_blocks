@@ -38,9 +38,9 @@ import pyarrow.parquet as pq
 import tqdm
 
 from smiles_blocks.files import PROCESSED_DATA_DIR, PROJ_ROOT, REPORTS_DIR
-from smiles_blocks.modelling import ModelsRegistry
+from smiles_blocks.modelling import FINAL_MODELS, ModelsRegistry
 
-MODELS = ModelsRegistry().models
+MODELS = {name: ModelsRegistry().models[name] for name in FINAL_MODELS}
 
 
 def _metrics(model, popt, x_tr, y_tr, x_te, y_te, plateau, x_last):
@@ -60,7 +60,7 @@ def _metrics(model, popt, x_tr, y_tr, x_te, y_te, plateau, x_last):
 def _fit(model, x, y):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        popt, _ = model.fit(x, y, p0=[y.max(), 1.0], maxfev=10_000)
+        popt, _ = model.fit(x, y, maxfev=10_000)  # per-model initial guess and bounds
     if not np.all(np.isfinite(popt)):
         raise RuntimeError("non-finite parameters")
     return popt
@@ -77,7 +77,7 @@ def evaluate_one(args):
     for b in budgets:
         tr = x <= b
         te = ~tr
-        if te.sum() > 0 and tr.sum() >= 3:
+        if te.sum() > 0 and tr.sum() >= 4:  # 3-parameter models need >= 4 points
             schemes.append((f"budget_{b}", tr, te))
     if (rep == 0).any() and (rep != 0).any():
         schemes.append(("replica", rep == 0, rep != 0))
@@ -91,7 +91,8 @@ def evaluate_one(args):
             try:
                 popt = _fit(model, x[tr], y[tr])
                 row["fit_ok"] = True
-                row["alpha"], row["beta"] = popt
+                row["alpha"], row["beta"] = popt[0], popt[1]
+                row["gamma"] = popt[2] if len(popt) > 2 else np.nan
                 if scheme == "full":
                     row["r2_full_from_train"] = model.r2_score(x, y, *popt)
                 else:
@@ -112,19 +113,22 @@ def _tasks_from_table(df: pd.DataFrame, budgets):
 
 
 def run_per_partition(datafolder: Path, out: Path, n_molecules: int, seed: int,
-                      budgets, nb_workers: int):
+                      budgets, nb_workers: int, parts=None):
     """Process partitions one at a time (memory-bounded, resumable).
 
     A uniform random fraction of molecules is drawn in each partition; with
     n_molecules <= 0, every molecule is used.
     """
     files = sorted(ds.dataset(str(datafolder), format="parquet").files)
+    total = sum(pq.read_metadata(f).num_rows for f in files)  # rows, for proportional sampling
+    if parts is not None:  # e.g. one SLURM array task per part
+        wanted = {f"part-{i}.parquet" for i in parts}
+        files = [f for f in files if Path(f).name in wanted]
     part_dir = out / "per_part"
     part_dir.mkdir(parents=True, exist_ok=True)
     cols = ["smiles", "split", "cumulative_count", "nb_unique_smiles", "replica"]
 
     use_all = n_molecules <= 0
-    total = sum(pq.read_metadata(f).num_rows for f in files)  # rows, for proportional sampling
 
     with mp.Pool(nb_workers) as pool:
         for i, f in enumerate(tqdm.tqdm(files, desc="Partitions")):
@@ -136,7 +140,7 @@ def run_per_partition(datafolder: Path, out: Path, n_molecules: int, seed: int,
                 smi = df.smiles.unique()
                 # proportional to this partition's share of rows
                 k = int(round(n_molecules * len(df) / total))
-                rng = np.random.default_rng(seed + i)
+                rng = np.random.default_rng(seed + int(Path(f).stem.split("-")[1]))
                 chosen = set(rng.choice(smi, size=min(k, len(smi)), replace=False))
                 df = df[df.smiles.isin(chosen)]
             tasks = _tasks_from_table(df, budgets)
@@ -179,12 +183,22 @@ def main():
     p.add_argument("--budgets", type=int, nargs="+", default=[1_110, 11_110, 111_110])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--nb_workers", type=int, default=mp.cpu_count())
+    p.add_argument("--parts", type=int, nargs="+", default=None,
+                   help="Only fit these part numbers (e.g. one SLURM array task each).")
+    p.add_argument("--skip_summary", action="store_true",
+                   help="Only write per-part results (summaries are built once all parts exist).")
+    p.add_argument("--summary_only", action="store_true",
+                   help="Skip fitting; summarise the existing per-part results.")
     a = p.parse_args()
 
     out = Path(a.output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
-    run_per_partition(Path(a.datafolder), out, a.n_molecules, a.seed, a.budgets, a.nb_workers)
+    if not a.summary_only:
+        run_per_partition(Path(a.datafolder), out, a.n_molecules, a.seed, a.budgets,
+                          a.nb_workers, a.parts)
+    if a.skip_summary:
+        return
     res = pd.read_parquet(out / "per_part", columns=[
         "smiles", "scheme", "function", "train_coverage", "fit_ok", "r2_full_from_train",
         "r2_test", "nrmse_test", "plateau_rel_err"])
