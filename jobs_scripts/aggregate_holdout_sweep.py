@@ -10,6 +10,10 @@ one row per (molecule, fraction, function). This reads them one model at a time
   smallest fraction of the sampling budget from which the predicted plateau stays
   within the tolerance for every larger fraction ("stable convergence").
 - convergence_per_molecule.parquet: that fraction for every molecule (git-ignored).
+- budget_summary.csv: per (function, fraction, q) accuracy of the predicted
+  sampling budget needed to reach q % of the plateau: ratio predicted / observed
+  draws, share within a factor 1.25, and the coverage actually reached when
+  stopping at the predicted budget.
 
     python jobs_scripts/aggregate_holdout_sweep.py \\
         --input-dir data/processed/holdout_sweep \\
@@ -34,6 +38,8 @@ from smiles_blocks.modelling import FINAL_MODELS  # noqa: E402
 
 FUNCTIONS = list(FINAL_MODELS)
 TOLERANCES = [0.20, 0.10, 0.05, 0.01]
+BUDGET_QS = (95, 99)
+RATIO_TOL = 1.25  # predicted budget within [obs / 1.25, obs * 1.25]
 QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 
 
@@ -51,6 +57,32 @@ def stable_convergence(err: np.ndarray, fractions: np.ndarray, tol: float) -> np
     return out
 
 
+def budget_summary(dataset, f: str) -> pd.DataFrame:
+    """Accuracy of the predicted sampling budget x_q for one model (see module doc)."""
+    if f"x{BUDGET_QS[0]}_pred" not in dataset.schema.names:
+        return pd.DataFrame()
+    rows = []
+    for q in BUDGET_QS:
+        t = dataset.to_table(columns=["fraction", f"x{q}_pred", f"x{q}_obs", f"cov_at_x{q}_pred"],
+                             filter=pc.field("function") == f)
+        df = t.to_pandas()
+        df["ratio"] = df[f"x{q}_pred"] / df[f"x{q}_obs"]  # NaN for failed fits
+        df["cov"] = df[f"cov_at_x{q}_pred"]
+        g = df.groupby("fraction")
+        s = pd.DataFrame({
+            "function": f, "q": q,
+            "x_obs_median": g[f"x{q}_obs"].median(),
+            "within_ratio_tol": g.ratio.apply(lambda r: ((r >= 1 / RATIO_TOL) & (r <= RATIO_TOL)).mean()),
+            "target_reached": g["cov"].apply(lambda c: (c >= q / 100 - 1e-6).mean()),
+        })
+        for qq in QUANTILES:
+            s[f"ratio_q{int(qq * 100):02d}"] = g.ratio.quantile(qq)
+            s[f"cov_q{int(qq * 100):02d}"] = g["cov"].quantile(qq)
+        rows.append(s.reset_index())
+        del df, t
+    return pd.concat(rows)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--input-dir", default="data/processed/holdout_sweep")
@@ -62,7 +94,7 @@ def main():
     dataset = ds.dataset(a.input_dir, format="parquet")
     print(f"{len(dataset.files)} parts")
 
-    summaries, conv_rows, per_mol = [], [], []
+    summaries, conv_rows, per_mol, budget_rows = [], [], [], []
     for f in FUNCTIONS:
         t = dataset.to_table(
             columns=["smiles", "split", "fraction", "fit_ok", "train_coverage",
@@ -114,6 +146,9 @@ def main():
         per_mol.append(mol)
         del df, t
 
+        budget_rows.append(budget_summary(dataset, f))
+
+    pd.concat(budget_rows).to_csv(out / "budget_summary.csv", index=False)
     pd.concat(summaries).to_csv(out / "sweep_summary.csv", index=False)
     conv = pd.DataFrame(conv_rows)
     conv.to_csv(out / "convergence_summary.csv", index=False)

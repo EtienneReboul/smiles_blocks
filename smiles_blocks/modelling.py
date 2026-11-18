@@ -59,6 +59,13 @@ class FittingModel(ABC):
         kwargs.setdefault("bounds", self.bounds)
         return curve_fit(self.func, x, y, p0=p0, **kwargs)
 
+    def x_at_fraction(self, q: float, *params: float) -> float:
+        """Number of draws at which the curve reaches ``q`` times its asymptote alpha.
+
+        Only defined for saturating models (closed form in the subclasses).
+        """
+        raise NotImplementedError(f"{self.name} has no finite asymptote")
+
     def predict(self, x: np.ndarray, *params: float, **named_params: float) -> np.ndarray:
         """Generate predictions given parameters."""
         return self.func(x, *params, **named_params)
@@ -127,6 +134,9 @@ class ExponentialModel(FittingModel):
     def func(self, x, alpha, beta):
         return alpha * (1 - np.exp(-beta * x))
 
+    def x_at_fraction(self, q, alpha, beta):
+        return -np.log1p(-q) / beta
+
 
 class WeibullModel(FittingModel):
     """Stretched exponential; reduces to the exponential model when gamma = 1."""
@@ -137,6 +147,9 @@ class WeibullModel(FittingModel):
 
     def func(self, x, alpha, beta, gamma):
         return alpha * (1 - np.exp(-((beta * x) ** gamma)))
+
+    def x_at_fraction(self, q, alpha, beta, gamma):
+        return (-np.log1p(-q)) ** (1 / gamma) / beta
 
     @property
     def bounds(self):
@@ -155,6 +168,9 @@ class HillModel(FittingModel):
 
     def func(self, x, alpha, beta, gamma):
         return alpha / (1 + (beta / x) ** gamma)
+
+    def x_at_fraction(self, q, alpha, beta, gamma):
+        return beta * (q / (1 - q)) ** (1 / gamma)
 
     @property
     def bounds(self):
@@ -177,6 +193,9 @@ class LomaxModel(FittingModel):
 
     def func(self, x, alpha, beta, gamma):
         return alpha * (1 - (1 + beta * x) ** (-gamma))
+
+    def x_at_fraction(self, q, alpha, beta, gamma):
+        return np.expm1(-np.log1p(-q) / gamma) / beta
 
     @property
     def bounds(self):

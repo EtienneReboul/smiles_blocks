@@ -25,6 +25,14 @@ Output: one row per (molecule, fraction, function) with
 - r2_full_from_train: R^2 over the full trajectory with the truncated-fit params
 - nrmse_test: RMSE on held-out observations / plateau (NaN at 100 %)
 - fit_ok: whether the fit succeeded (fewer than n_params + 1 points counts as a failure)
+- alpha, beta, gamma: fitted parameters (gamma NaN for 2-parameter models)
+
+Sampling-budget prediction, for q in QUANTILES (95 %, 99 %):
+- x{q}_pred: draws at which the fitted curve reaches q x its own asymptote alpha
+- x{q}_obs: draws at which each replica actually reached q x its own final unique
+  count (log-x interpolation between grid points), median over replicas
+- cov_at_x{q}_pred: unique SMILES actually collected at x{q}_pred / final count,
+  mean over replicas (1 when x{q}_pred is beyond the sampled range)
 """
 
 from __future__ import annotations
@@ -48,7 +56,10 @@ from smiles_blocks.modelling import FINAL_MODELS, ModelsRegistry  # noqa: E402
 
 FUNCTIONS = list(FINAL_MODELS)
 MODELS = {k: ModelsRegistry().models[k] for k in FUNCTIONS}
-METRICS = ["train_coverage", "plateau_rel_err", "r2_full_from_train", "nrmse_test"]
+QUANTILES = (95, 99)
+PARAMS = ["alpha", "beta", "gamma"]
+METRICS = ["train_coverage", "plateau_rel_err", "r2_full_from_train", "nrmse_test", *PARAMS,
+           *[f"{c}{q}_{k}" for q in QUANTILES for c, k in (("x", "pred"), ("x", "obs"), ("cov_at_x", "pred"))]]
 
 SCHEMA = pa.schema([
     ("smiles", pa.dictionary(pa.int32(), pa.string())),
@@ -61,25 +72,44 @@ SCHEMA = pa.schema([
 ])
 
 
+_FAILED = (False, np.nan, np.nan, np.nan, None)
+
+
+def _first_crossing(xr, yr, target):
+    """Draws at which a (non-decreasing) replica trajectory first reaches ``target``."""
+    i = int(np.argmax(yr >= target))
+    if i == 0:
+        return xr[0]
+    t = (target - yr[i - 1]) / (yr[i] - yr[i - 1])
+    return float(np.exp(np.log(xr[i - 1]) + t * (np.log(xr[i]) - np.log(xr[i - 1]))))
+
+
+def _y_at(xr, yr, xq):
+    """Unique SMILES of a replica after ``xq`` draws (log-x interpolation)."""
+    if not np.isfinite(xq):
+        return yr[-1]
+    return float(np.interp(np.log(max(xq, 1e-12)), np.log(xr), yr, left=0.0))
+
+
 def _fit_and_score(model, x, y, tr, plateau, x_last):
-    """Return (fit_ok, plateau_rel_err, r2_full_from_train, nrmse_test)."""
+    """Return (fit_ok, plateau_rel_err, r2_full_from_train, nrmse_test, popt)."""
     if tr.sum() < model.n_params + 1:
-        return False, np.nan, np.nan, np.nan
+        return _FAILED
     try:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             popt, _ = model.fit(x[tr], y[tr], maxfev=10_000)  # per-model initial guess and bounds
             if not np.all(np.isfinite(popt)):
-                return False, np.nan, np.nan, np.nan
+                return _FAILED
             pred = model.predict(x, *popt)
             plateau_err = model.predict(np.array([x_last]), *popt)[0] / plateau - 1
     except Exception:
-        return False, np.nan, np.nan, np.nan
+        return _FAILED
     ss_tot = np.sum((y - y.mean()) ** 2)
     r2 = 1 - np.sum((y - pred) ** 2) / ss_tot if ss_tot > 0 else np.nan
     te = ~tr
     nrmse = np.sqrt(np.mean((y[te] - pred[te]) ** 2)) / plateau if te.any() else np.nan
-    return True, plateau_err, r2, nrmse
+    return True, plateau_err, r2, nrmse, popt
 
 
 def sweep_one(args):
@@ -90,6 +120,19 @@ def sweep_one(args):
     # per-observation cutoff reference: final draw count of the observation's replica
     xmax_rep = {r: x[rep == r].max() for r in np.unique(rep)}
     ref = np.array([xmax_rep[r] for r in rep])
+    reps = [(x[rep == r], y[rep == r]) for r in np.unique(rep)]  # each sorted by x
+    x_obs = {q: float(np.median([_first_crossing(xr, yr, q / 100 * yr.max()) for xr, yr in reps]))
+             for q in QUANTILES}
+
+    def budget_metrics(name, popt):
+        """x{q}_pred and cov_at_x{q}_pred for one fit."""
+        res = {}
+        for q in QUANTILES:
+            xp = float(MODELS[name].x_at_fraction(q / 100, *popt)) if popt is not None else np.nan
+            res[f"x{q}_pred"] = xp
+            res[f"cov_at_x{q}_pred"] = (np.mean([_y_at(xr, yr, xp) / yr.max() for xr, yr in reps])
+                                        if np.isfinite(xp) else np.nan)
+        return res
 
     n = len(fractions) * len(FUNCTIONS)
     out = {
@@ -105,8 +148,9 @@ def sweep_one(args):
         cov = y[tr].max() / plateau if tr.any() else 0.0
         for name in FUNCTIONS:
             if (key, name) not in cache:
-                cache[(key, name)] = _fit_and_score(MODELS[name], x, y, tr, plateau, x_last)
-            ok, perr, r2, nrmse = cache[(key, name)]
+                fs = _fit_and_score(MODELS[name], x, y, tr, plateau, x_last)
+                cache[(key, name)] = (fs, budget_metrics(name, fs[4]))
+            (ok, perr, r2, nrmse, popt), bm = cache[(key, name)]
             out["fraction"][i] = f
             out["function"][i] = name
             out["n_train"][i] = tr.sum()
@@ -115,6 +159,13 @@ def sweep_one(args):
             out["plateau_rel_err"][i] = perr
             out["r2_full_from_train"][i] = r2
             out["nrmse_test"][i] = nrmse
+            pv = list(popt) if popt is not None else []
+            for j, pname in enumerate(PARAMS):
+                out[pname][i] = pv[j] if j < len(pv) else np.nan
+            for q in QUANTILES:
+                out[f"x{q}_obs"][i] = x_obs[q]
+            for k, v in bm.items():
+                out[k][i] = v
             i += 1
     out["smiles"] = smiles
     out["split"] = split

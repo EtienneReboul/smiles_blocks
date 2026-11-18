@@ -227,3 +227,20 @@ class TestR2Score:
         y = np.array([100, 200, 300, 400])
         r2 = model.r2_score(x, y, alpha=1, beta=1)
         assert r2 < 0
+
+
+class TestXAtFraction:
+    def test_final_models_invert_their_curve(self):
+        params = {"exp": (100, 1e-3), "weibull": (100, 1e-3, 0.9),
+                  "hill": (100, 500, 1.3), "lomax": (100, 1e-3, 4.0)}
+        registry = ModelsRegistry().models
+        for name in FINAL_MODELS:
+            model = registry[name]
+            for q in (0.5, 0.95, 0.99):
+                x = model.x_at_fraction(q, *params[name])
+                y = model.predict(np.array([x]), *params[name])[0]
+                assert np.isclose(y, q * params[name][0], rtol=1e-9), (name, q)
+
+    def test_unbounded_models_raise(self):
+        with pytest.raises(NotImplementedError):
+            ModelsRegistry().models["log"].x_at_fraction(0.95, 1.0, 1.0)
